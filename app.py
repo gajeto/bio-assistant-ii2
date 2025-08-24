@@ -1,3 +1,7 @@
+import pkgutil, streamlit as st
+installed = {m.name for m in pkgutil.iter_modules()}
+st.write("🔎 Installed packages include plotly?", "plotly" in installed)
+
 import os
 import io
 import requests
