@@ -4,7 +4,7 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
+from plotly import express as px
 
 from typing import Dict, List, Tuple, Optional
 from sklearn.model_selection import train_test_split
