@@ -9,10 +9,12 @@ try:
 except Exception:
     GROQ_OK = False
 
+# llm_groq.py
 GROQ_MODEL_CATALOG = {
     "Llama 3.1 8B (rápido)": "llama-3.1-8b-instant",
-    "Llama 3.1 70B (calidad)": "llama-3.1-70b-versatile",
-    "Llama 3 (8B) 8192 ctx": "llama3-8b-8192",
+    "Llama 3.3 70B (mejor calidad)": "llama-3.3-70b-versatile",
+    "GPT-OSS 20B (open-weight)": "openai/gpt-oss-20b",
+    "GPT-OSS 120B (open-weight)": "openai/gpt-oss-120b",
     "Mixtral 8x7B 32k": "mixtral-8x7b-32768",
 }
 
@@ -27,7 +29,9 @@ def build_system_prompt(eda_summary: str, ml_block: str = "") -> str:
     para minimizar 'links inventados'.
     """
     return (
-        "Eres un asistente de datos genéticos. Responde en **español**, breve y conservador. "
+        "Eres un asistente de datos genéticos, y también de biología general que identifica especies por su descripción general y características biológicas. "
+        "Además, puedes explicar conceptos biológicos o géneticos complejos"
+        "Responde en **español**, breve y conservador. Puedes dar ejemplos de análogias si aplica. "
         "No des consejo médico. Usa el contexto provisto para cifras.\n\n"
         f"RESUMEN EDA:\n{eda_summary}\n\n{ml_block}\n"
         "Al final, agrega una sección **Recursos adicionales (curados)** con 2–4 enlaces "
