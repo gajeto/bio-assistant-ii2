@@ -10,8 +10,10 @@ from utils_data import (
 )
 from ml_utils import (
     infer_task, make_preprocessor,
-    ml_metrics_and_artifacts, ml_key_insights, ml_objective_interpretation
+    ml_metrics_and_artifacts, ml_key_insights, ml_objective_interpretation,
+    safe_train_test_split
 )
+
 from llm_groq import GroqLLM, build_system_prompt
 from ui_theme import apply_bio_theme
 from demo_tab import render_demo_tab
@@ -65,11 +67,11 @@ if up is not None:
     df = load_csv(up)
 elif usar_demo:
     df = demo_data(1000)
+    df = cap_rows(df, 1000)
 else:
     st.info("Sube un CSV o activa el demo en la barra lateral.")
     st.stop()
 
-df = cap_rows(df, 1000)
 st.success(f"Datos cargados: {df.shape[0]} filas × {df.shape[1]} columnas")
 st.dataframe(df.head(), use_container_width=True)
 
@@ -153,17 +155,78 @@ with tab_ml:
     tarea = infer_task(y)
     st.write(f"Tarea detectada: **{tarea}**")
 
+    # Controles para el split
+    st.markdown("**Configuración de partición train/test**")
+    csplit = st.columns(3)
+    with csplit[0]:
+        test_size = st.slider("Proporción de test", 0.10, 0.50, 0.20, 0.05)
+    with csplit[1]:
+        force_strat = st.checkbox("Forzar estratificación auto-ajustando test_size", value=True)
+    with csplit[2]:
+        max_ts = st.slider("Máximo test_size permitido", 0.20, 0.50, max(0.35, test_size), 0.05,
+                           help="Se usa solo si está activado 'Forzar estratificación'.")
+
+    # Mostrar distribución de clases antes (si clasificación)
+    if tarea == "clasificación":
+        st.markdown("**Distribución de la etiqueta (global):**")
+        vc_abs = y.astype(str).value_counts()
+        vc_pct = (y.astype(str).value_counts(normalize=True) * 100).round(1)
+        st.dataframe(
+            pd.DataFrame({"conteo": vc_abs, "porcentaje_%": vc_pct}),
+            use_container_width=True, height=240
+        )
+
+    # Preparar preprocesamiento + modelo
     pre = make_preprocessor(X)
     modelo = LogisticRegression(max_iter=600) if tarea == "clasificación" else LinearRegression()
     pipe = Pipeline([("prep", pre), ("model", modelo)])
 
-    estrat = y if (tarea == "clasificación" and y.nunique() >= 2) else None
-    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42, stratify=estrat)
-
     if st.button("Entrenar baseline"):
+        # Split robusto
+        X_tr, X_te, y_tr, y_te, split_info = safe_train_test_split(
+            X, y, tarea=tarea,
+            test_size=float(test_size),
+            random_state=42,
+            min_per_class=2,
+            auto_increase_test_size=bool(force_strat),
+            max_test_size=float(max_ts),
+        )
+
+        # Feedback del split
+        colm = st.columns(3)
+        with colm[0]:
+            st.metric("Clases", split_info.get("n_classes") or (y.nunique() if tarea=="clasificación" else "-"))
+        with colm[1]:
+            st.metric("test_size usado", f"{split_info['used_test_size']:.2f}")
+        with colm[2]:
+            st.metric("Estratificado", "Sí" if split_info["stratified"] else "No")
+        if split_info.get("rare_classes"):
+            st.warning("Clases raras (<2 ejemplos): " + ", ".join(split_info["rare_classes"]))
+        if not split_info["stratified"] and tarea == "clasificación":
+            st.warning(split_info.get("reason") or
+                       "Estratificación desactivada: clases muy raras o test_size insuficiente.")
+
+        # Mostrar cómo quedó el reparto por clase en train/test (si clasificación)
+        if tarea == "clasificación":
+            ct1, ct2 = st.columns(2)
+            with ct1:
+                st.write("**Train – distribución por clase**")
+                vc_tr = y_tr.astype(str).value_counts()
+                vc_tr_pct = (y_tr.astype(str).value_counts(normalize=True)*100).round(1)
+                st.dataframe(pd.DataFrame({"conteo": vc_tr, "porcentaje_%": vc_tr_pct}),
+                             use_container_width=True, height=220)
+            with ct2:
+                st.write("**Test – distribución por clase**")
+                vc_te = y_te.astype(str).value_counts()
+                vc_te_pct = (y_te.astype(str).value_counts(normalize=True)*100).round(1)
+                st.dataframe(pd.DataFrame({"conteo": vc_te, "porcentaje_%": vc_te_pct}),
+                             use_container_width=True, height=220)
+
+        # Entrenar y mostrar resultados
         ml_art = ml_metrics_and_artifacts(pipe, X_tr, X_te, y_tr, y_te, tarea)
         st.session_state["ml"] = {"pipeline": pipe, "X_te": X_te, "y_te": y_te, **ml_art}
 
+    # Mostrar resultados si existen (igual que antes)
     if "ml" in st.session_state and st.session_state["ml"]["tarea"] == tarea:
         ml = st.session_state["ml"]
         from plotly import express as px
@@ -194,6 +257,7 @@ with tab_ml:
                             use_container_width=True)
 
         st.info(ml_objective_interpretation(ml))
+
 
 # ===== CHAT TAB (Groq con streaming) =====
 with tab_chat:
