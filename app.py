@@ -16,7 +16,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, LinearRegression
 import requests
 
-# —— Import Plotly (robusto) ——
+# —— Plotly (robusto) ——
 try:
     from plotly import express as px
     import plotly.graph_objects as go
@@ -24,6 +24,15 @@ try:
 except Exception as e:
     PLOTLY_OK = False
     PX_ERR = e
+
+# —— BACKEND LOCAL (transformers/tokenizers) ——
+# Si no vas a usar backend local, puedes comentar estas importaciones.
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    TRANSFORMERS_OK = True
+except Exception as e:
+    TRANSFORMERS_OK = False
 
 # ===================== Configuración de página =====================
 st.set_page_config(page_title="Asistente Genético (EDA + Chat)", page_icon="🧬", layout="wide")
@@ -137,47 +146,100 @@ def eda_summary_markdown(eda: Dict) -> str:
                       f"min {d['min']:.4f} | 50% {d['50%']:.4f} | max {d['max']:.4f}")
     return "\n".join(md)
 
+# ===================== Backend local: carga cacheada =====================
+@st.cache_resource(show_spinner=True)
+def load_local_model(model_id: str, hf_token: str):
+    """
+    Descarga y cachea tokenizer y modelo para uso local (CPU).
+    Requiere transformers/tokenizers/torch.
+    """
+    if not TRANSFORMERS_OK:
+        raise RuntimeError("transformers/torch no están instalados. Agrega a requirements.txt.")
+
+    tok = AutoTokenizer.from_pretrained(
+        model_id, token=hf_token, use_fast=True, trust_remote_code=True
+    )
+    mdl = AutoModelForCausalLM.from_pretrained(
+        model_id, token=hf_token,
+        torch_dtype=torch.float32,   # CPU; si tienes GPU, ajusta dtype y device_map
+        low_cpu_mem_usage=True,
+        trust_remote_code=True
+    )
+    mdl.eval()
+    return tok, mdl
+
+def local_generate(tokenizer, model, prompt: str, max_new_tokens: int, temperature: float) -> str:
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    inputs = tokenizer(prompt, return_tensors="pt")
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=int(max_new_tokens),
+            do_sample=float(temperature) > 0.0,
+            temperature=max(0.01, float(temperature)),
+            top_p=0.9,
+            repetition_penalty=1.1,
+            pad_token_id=pad_id
+        )
+    gen_ids = out[0][inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True)
+
 # ===================== LLM: badge de estado =====================
 def llm_status_badge(llm: "TinyLLM") -> str:
+    which = "Local (transformers)" if llm.backend == "local" else "API (HF Inference)"
     if llm.available():
-        return f"🟢 **LLM conectado** — modelo: `{llm.model}` · temp={st.session_state.get('llm_temp',0.2)} · max_tokens={st.session_state.get('llm_max_tokens',350)}"
-    return "🔴 **LLM desconectado** — configura `HF_TOKEN` en *Secrets*."
+        return (f"🟢 **LLM conectado** — {which} — modelo: `{llm.model}` · "
+                f"temp={st.session_state.get('llm_temp',0.2)} · "
+                f"max_tokens={st.session_state.get('llm_max_tokens',350)}")
+    return f"🟠 **LLM parcialmente configurado** — {which}. Revisa token/permisos si usas API."
 
-# =============== Cliente LLM (español, ligero, chat) ===============
+# =============== Cliente LLM con DOS backends (API y Local) ===============
 class TinyLLM:
     """
-    Modelo pequeño en HuggingFace Inference.
-    - Lee HF_TOKEN de env o st.secrets.
-    - Usa HF_MODEL si está; si no, TinyLlama por defecto.
-    - Si hay st.session_state['hf_model_override'], prioriza ese.
-    - Manejo de errores HTTP en claro (401,403,404,429,503).
-    - Respeta temperatura y máx. tokens desde st.session_state.
+    LLM con dos backends:
+      - API (HF Inference): usa requests + HF_TOKEN
+      - Local (transformers/tokenizers): descarga y ejecuta el modelo aquí (CPU)
+    Lee modelo de st.session_state['hf_model_override'] y backend de st.session_state['llm_backend'].
+    Maneja errores HTTP en claro. Respeta temperatura y max tokens desde la UI.
     """
-    def __init__(self, model: str = None, timeout: int = 60):
+    def __init__(self, timeout: int = 60):
+        # modelo activo (selector del sidebar o secreto/env)
         def _get_secret(key, default=None):
             val = os.environ.get(key)
             if not val:
                 try:
-                    val = st.secrets.get(key, default)  # st ya importado
+                    val = st.secrets.get(key, default)
                 except Exception:
                     val = default
             return val
 
-        base_model = model or _get_secret("HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-        pick = st.session_state.get("hf_model_override")
-        self.model = pick or base_model
+        self.model = st.session_state.get("hf_model_override") or _get_secret(
+            "HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        )
         self.hf_token = _get_secret("HF_TOKEN", None)
         self.timeout = timeout
+        self.backend = st.session_state.get("llm_backend", "api")  # "api" | "local"
 
     def available(self) -> bool:
-        return bool(self.hf_token)
+        if self.backend == "api":
+            # Con API pública algunos modelos responden sin token, pero lo normal es necesitarlo
+            return bool(self.hf_token)
+        else:  # local
+            return TRANSFORMERS_OK  # requiere libs instaladas
 
     def _human_error(self, status: int, body_text: str) -> str:
         msg = (body_text or "")[:400]
         if status == 401:
             return "⚠️ 401 No autorizado: revisa `HF_TOKEN`."
         if status == 403:
-            return "⚠️ 403 Prohibido: modelo privado o sin permisos."
+            return (
+                "⚠️ 403 Prohibido: el modelo es privado o requiere aceptar sus términos.\n"
+                "Soluciones:\n"
+                "1) Usa un `HF_TOKEN` con acceso.\n"
+                "2) En la página del modelo, pulsa 'Request access'/'Agree and access repository'.\n"
+                "3) Selecciona un modelo público en el sidebar y reintenta.\n"
+                f"Detalle: {msg}"
+            )
         if status == 404:
             return "⚠️ 404 No encontrado: revisa `HF_MODEL`/selector."
         if status == 429:
@@ -187,20 +249,31 @@ class TinyLLM:
         return f"⚠️ Error HTTP {status}: {msg}"
 
     def ask(self, system_prompt: str, user_prompt: str) -> str:
-        # Ajustes desde UI
         temp = float(st.session_state.get("llm_temp", 0.2))
         max_tokens = int(st.session_state.get("llm_max_tokens", 350))
+        prompt = f"Sistema: {system_prompt}\n\nUsuario: {user_prompt}\n\nAsistente:"
 
-        # Sin token → modo offline con contexto EDA
-        if not self.available():
+        # Backend LOCAL
+        if self.backend == "local":
+            if not TRANSFORMERS_OK:
+                return "⚠️ Backend local no disponible: instala transformers/tokenizers/torch."
+            try:
+                tok, mdl = load_local_model(self.model, self.hf_token)
+                out = local_generate(tok, mdl, prompt, max_new_tokens=max_tokens, temperature=temp)
+                return out.strip()
+            except Exception as e:
+                return f"⚠️ Error en backend local (transformers/tokenizers): {e}"
+
+        # Backend API (HF Inference)
+        if not self.hf_token:
+            # Modo offline si no hay token para API
             lines = [ln for ln in system_prompt.splitlines()
                      if any(tok in ln.lower() for tok in user_prompt.lower().split()[:5])]
             if not lines:
                 lines = system_prompt.splitlines()[:15]
-            return "Modo sin LLM (no hay HF_TOKEN). Contexto EDA:\n\n" + "\n".join(lines[:40])
+            return "Modo sin token para API. Activa 'Local' o configura HF_TOKEN. Contexto EDA:\n\n" + "\n".join(lines[:40])
 
         headers = {"Authorization": f"Bearer {self.hf_token}", "Accept": "application/json"}
-        prompt = f"Sistema: {system_prompt}\n\nUsuario: {user_prompt}\n\nAsistente:"
         payload = {
             "inputs": prompt,
             "parameters": {"max_new_tokens": max_tokens, "temperature": temp},
@@ -243,20 +316,27 @@ with st.sidebar:
     PLOTLY_TEMPLATE = "plotly_dark" if tema_oscuro else "plotly"
 
     st.header("3) LLM (español, pequeño)")
-    st.write("Proveedor: HuggingFace Inference. Requiere `HF_TOKEN` en Secrets.")
+    backend = st.radio(
+        "Backend de LLM",
+        ["API (HF Inference)", "Local (transformers/tokenizers)"],
+        index=0,
+        help="API = peticiones HTTP a Hugging Face; Local = descarga y ejecuta el modelo aquí."
+    )
+    st.session_state["llm_backend"] = "local" if backend.startswith("Local") else "api"
+
     modelo_key = st.selectbox(
         "Modelo:",
         options=list(MODEL_CATALOG.keys()),
         index=0,
-        help="Elige un modelo liviano para preguntas en español."
+        help="Elige un modelo liviano."
     )
     modelo_id = MODEL_CATALOG[modelo_key]
     custom_id = st.text_input("Modelo personalizado (opcional)", value="")
     if custom_id.strip():
         modelo_id = custom_id.strip()
     st.session_state["hf_model_override"] = modelo_id
+    st.caption(f"Usando: `{modelo_id}`")
 
-    # Controles del modelo
     st.markdown("**Parámetros del modelo**")
     st.session_state["llm_temp"] = st.slider("Temperatura", 0.0, 1.0, st.session_state.get("llm_temp", 0.2), 0.05,
                                              help="Menor = más determinista.")
@@ -281,7 +361,7 @@ st.dataframe(df.head(), use_container_width=True)
 eda = basic_eda(df)
 
 # ===================== Pestañas =====================
-tab_eda, tab_ml, tab_chat, tab_export = st.tabs(["📊 EDA", "🤖 ML", "💬 Chat", "📥 Exportar"])
+tab_eda, tab_ml, tab_chat, tab_export = st.tabs(["📊 EDA", "🤦 ML", "💬 Chat", "📥 Exportar"])
 
 # ------------------------------- EDA TAB -------------------------------
 with tab_eda:
@@ -426,7 +506,8 @@ with tab_chat:
             test_resp = llm.ask("Eres un sistema de prueba.", "Di 'ok' en una palabra.")
             st.write("**Respuesta de prueba:**", test_resp[:500])
     with cols[1]:
-        st.write(f"**Modelo activo:** `{llm.model}`")
+        st.write(f"**Backend:** {'Local (transformers)' if llm.backend=='local' else 'API (HF Inference)'}")
+        st.write(f"**Modelo:** `{llm.model}`")
 
     # Historial de chat
     if "mensajes" not in st.session_state:
@@ -450,6 +531,20 @@ with tab_chat:
         with st.chat_message("user"):
             st.markdown(pregunta)
         respuesta = llm.ask(sistema, pregunta)
+
+        # Sugerencia rápida si 403
+        if isinstance(respuesta, str) and respuesta.startswith("⚠️ 403"):
+            st.warning("El modelo actual no está accesible con tu token.")
+            cA, cB = st.columns(2)
+            with cA:
+                if st.button("Cambiar a modelo público (TinyLlama)"):
+                    st.session_state["hf_model_override"] = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+                    st.experimental_rerun()
+            with cB:
+                if st.button("Cambiar a Qwen 0.5B"):
+                    st.session_state["hf_model_override"] = "Qwen/Qwen2.5-0.5B-Instruct"
+                    st.experimental_rerun()
+
         st.session_state.mensajes.append({"role":"assistant", "content":respuesta})
         with st.chat_message("assistant"):
             st.markdown(respuesta)

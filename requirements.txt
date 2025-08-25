@@ -4,3 +4,7 @@ numpy>=1.26.4
 scikit-learn>=1.5.1
 plotly>=5.22.0
 requests>=2.32.3
+transformers>=4.42.0
+tokenizers>=0.15.2
+torch>=2.2.0          # CPU está bien; si usas GPU, instala el wheel apropiado
+accelerate>=0.30.0    # opcional pero recomendado
