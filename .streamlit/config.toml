@@ -1,0 +1,6 @@
+[theme]
+primaryColor="#16A34A"          # emerald-600
+backgroundColor="#F0FDF4"       # emerald-50
+secondaryBackgroundColor="#ECFDF5" # teal/emerald-50
+textColor="#064E3B"             # emerald-900
+font="sans serif"
