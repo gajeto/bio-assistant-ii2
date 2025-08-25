@@ -3,7 +3,8 @@ import os
 import numpy as np
 import pandas as pd
 import streamlit as st
-from typing import Dict
+from typing import Dict, List, Tuple, Optional
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score, f1_score, mean_absolute_error, mean_squared_error, r2_score,
@@ -14,9 +15,9 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, LinearRegression
-import requests
+from sklearn.inspection import permutation_importance
 
-# —— Plotly (robusto) ——
+# Plotly (gráficas interactivas)
 try:
     from plotly import express as px
     import plotly.graph_objects as go
@@ -25,15 +26,7 @@ except Exception as e:
     PLOTLY_OK = False
     PX_ERR = e
 
-# —— BACKEND LOCAL (transformers/tokenizers) ——
-try:
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    TRANSFORMERS_OK = True
-except Exception:
-    TRANSFORMERS_OK = False
-
-# —— GROQ SDK ——
+# GROQ SDK
 try:
     from groq import Groq
     GROQ_OK = True
@@ -41,18 +34,12 @@ except Exception:
     GROQ_OK = False
 
 # ===================== Configuración de página =====================
-st.set_page_config(page_title="Asistente Genético (EDA + Chat)", page_icon="🧬", layout="wide")
-st.title("🧬 Asistente Genético: EDA + Chat LLM (ligero)")
-st.caption("Sube un CSV (hasta ~1.000 filas) → EDA enriquecido → Baseline ML → Chat en español. "
+st.set_page_config(page_title="Asistente Genético (EDA + ML + Groq)", page_icon="🧬", layout="wide")
+st.title("🧬 Asistente Genético: EDA + ML + Chat (Groq)")
+st.caption("Sube un CSV (hasta ~1.000 filas) → EDA → Baseline ML → Chat en español con Groq. "
            "Herramienta educativa; **no** es consejo médico.")
 
-# ===================== Catálogo de modelos =====================
-HF_MODEL_CATALOG = {
-    "TinyLlama 1.1B Chat (por defecto)": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    "Llama 3.2 1B Instruct": "meta-llama/Llama-3.2-1B-Instruct",
-    "Qwen2.5 0.5B Instruct": "Qwen/Qwen2.5-0.5B-Instruct",
-    "Falcon 1B Instruct": "tiiuae/falcon-1b-instruct",
-}
+# ===================== Catálogo de modelos (Groq) =====================
 GROQ_MODEL_CATALOG = {
     "Llama 3.1 8B (rápido)": "llama-3.1-8b-instant",
     "Llama 3.1 70B (calidad)": "llama-3.1-70b-versatile",
@@ -117,14 +104,8 @@ def infer_task(y: pd.Series) -> str:
 def make_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
     num_cols = list(X.select_dtypes(include=np.number).columns)
     cat_cols = [c for c in X.columns if c not in num_cols]
-    num_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="mean")),
-        ("scaler", StandardScaler())
-    ])
-    cat_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore"))
-    ])
+    num_pipe = Pipeline([("imputer", SimpleImputer(strategy="mean")), ("scaler", StandardScaler())])
+    cat_pipe = Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", OneHotEncoder(handle_unknown="ignore"))])
     return ColumnTransformer([("num", num_pipe, num_cols), ("cat", cat_pipe, cat_cols)])
 
 def eda_summary_text(eda: Dict, df: pd.DataFrame, max_lines=80) -> str:
@@ -136,8 +117,7 @@ def eda_summary_text(eda: Dict, df: pd.DataFrame, max_lines=80) -> str:
         lines.append("Resumen numérico (5 primeras):")
         for c in list(eda["desc_num"].index)[:5]:
             d = eda["desc_num"].loc[c]
-            lines.append(f"- {c}: media={d['mean']:.4f}, std={d['std']:.4f}, "
-                         f"min={d['min']:.4f}, mediana={d['50%']:.4f}, max={d['max']:.4f}")
+            lines.append(f"- {c}: media={d['mean']:.4f}, std={d['std']:.4f}, min={d['min']:.4f}, mediana={d['50%']:.4f}, max={d['max']:.4f}")
     return "\n".join(lines[:max_lines])
 
 def eda_summary_markdown(eda: Dict) -> str:
@@ -154,210 +134,197 @@ def eda_summary_markdown(eda: Dict) -> str:
         md.append("\n## Descriptivos numéricos (primeras 5 variables)")
         for c in list(eda["desc_num"].index)[:5]:
             d = eda["desc_num"].loc[c]
-            md.append(f"- **{c}** → media {d['mean']:.4f} | std {d['std']:.4f} | "
-                      f"min {d['min']:.4f} | 50% {d['50%']:.4f} | max {d['max']:.4f}")
+            md.append(f"- **{c}** → media {d['mean']:.4f} | std {d['std']:.4f} | min {d['min']:.4f} | 50% {d['50%']:.4f} | max {d['max']:.4f}")
     return "\n".join(md)
 
-# ===================== Backend local: carga cacheada =====================
-@st.cache_resource(show_spinner=True)
-def load_local_model(model_id: str, hf_token: str):
-    if not TRANSFORMERS_OK:
-        raise RuntimeError("transformers/torch no están instalados. Agrega a requirements.txt.")
-    tok = AutoTokenizer.from_pretrained(
-        model_id, token=hf_token, use_fast=True, trust_remote_code=True
-    )
-    mdl = AutoModelForCausalLM.from_pretrained(
-        model_id, token=hf_token,
-        torch_dtype=torch.float32,   # CPU; si tienes GPU, ajusta dtype/device_map
-        low_cpu_mem_usage=True,
-        trust_remote_code=True
-    )
-    mdl.eval()
-    return tok, mdl
+def eda_key_insights(eda: Dict, df: pd.DataFrame, target_guess: Optional[str]=None, max_corr_pairs: int = 3) -> List[str]:
+    bullets = []
+    nrows, ncols = eda["shape"]
+    bullets.append(f"Dataset con {nrows} filas y {ncols} columnas.")
+    missing = pd.Series(eda["null_pct"]).sort_values(ascending=False)
+    top_missing = missing[missing > 0].head(3)
+    if not top_missing.empty:
+        bullets.append("Mayor % de faltantes: " + ", ".join(f"{k} ({v}%)" for k, v in top_missing.items()))
+    if target_guess and target_guess in df.columns:
+        vc = df[target_guess].value_counts(dropna=False)
+        if len(vc) > 0:
+            total = len(df)
+            parts = [f"{k}: {v} ({(v/total)*100:.1f}%)" for k, v in vc.head(4).items()]
+            bullets.append(f"Distribución de {target_guess}: " + ", ".join(parts))
+    num_cols = df.select_dtypes(include=np.number).columns
+    if len(num_cols) >= 2:
+        corr = df[num_cols].corr(numeric_only=True).abs()
+        mask = np.triu(np.ones(corr.shape), k=1).astype(bool)
+        corr_upper = corr.where(mask)
+        pairs = corr_upper.unstack().dropna().sort_values(ascending=False).head(max_corr_pairs)
+        if not pairs.empty:
+            bullets.append("Correlaciones fuertes: " + ", ".join(f"{a}~{b}={v:.2f}" for (a, b), v in pairs.items()))
+    return bullets
 
-def local_generate(tokenizer, model, prompt: str, max_new_tokens: int, temperature: float) -> str:
-    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-    inputs = tokenizer(prompt, return_tensors="pt")
-    with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=int(max_new_tokens),
-            do_sample=float(temperature) > 0.0,
-            temperature=max(0.01, float(temperature)),
-            top_p=0.9,
-            repetition_penalty=1.1,
-            pad_token_id=pad_id
-        )
-    gen_ids = out[0][inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(gen_ids, skip_special_tokens=True)
+# ===================== ML: métricas, importancias, interpretación =====================
+def compute_perm_importance(pipeline: Pipeline, X_te: pd.DataFrame, y_te: pd.Series, tarea: str, topk: int = 8) -> pd.DataFrame:
+    scoring = "f1_macro" if tarea == "clasificación" else "r2"
+    pi = permutation_importance(pipeline, X_te, y_te, n_repeats=5, random_state=42, n_jobs=-1, scoring=scoring)
+    importances = pd.DataFrame({
+        "feature": X_te.columns,
+        "importance": pi.importances_mean,
+        "std": pi.importances_std
+    }).sort_values("importance", ascending=False)
+    return importances.head(topk)
 
-# ===================== LLM: badge de estado =====================
-def llm_status_badge(llm: "TinyLLM") -> str:
-    back = {"api": "API (HF Inference)", "groq": "Groq API (streaming)", "local": "Local (transformers)"}[llm.backend]
-    if llm.available():
-        return (f"🟢 **LLM conectado** — {back} — modelo: `{llm.model}` · "
-                f"temp={st.session_state.get('llm_temp',0.2)} · "
-                f"máx_tokens={st.session_state.get('llm_max_tokens',350)}")
-    return f"🟠 **LLM parcialmente configurado** — {back}. Revisa claves/permisos."
+def ml_metrics_and_artifacts(pipe: Pipeline, X_tr, X_te, y_tr, y_te, tarea: str) -> Dict:
+    pipe.fit(X_tr, y_tr)
+    pred_tr = pipe.predict(X_tr)
+    pred_te = pipe.predict(X_te)
 
-# =============== Cliente LLM con TRES backends (HF API, Groq, Local) ===============
-class TinyLLM:
-    """
-    Backends:
-      - 'api'  (HF Inference): requests + HF_TOKEN
-      - 'groq' (Groq API): SDK + GROQ_API_KEY (soporta streaming)
-      - 'local' (transformers/tokenizers): modelo en CPU
-    """
-    def __init__(self, timeout: int = 60):
-        def _get_secret(key, default=None):
-            val = os.environ.get(key)
-            if not val:
-                try:
-                    val = st.secrets.get(key, default)
-                except Exception:
-                    val = default
-            return val
+    out = {"tarea": tarea}
 
-        self.backend = st.session_state.get("llm_backend", "api")  # "api" | "groq" | "local"
-        self.model = st.session_state.get("llm_model_id") or _get_secret(
-            "HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-        )
-        self.hf_token = _get_secret("HF_TOKEN", None)
-        self.groq_key = _get_secret("GROQ_API_KEY", None)
-        self.timeout = timeout
+    if tarea == "clasificación":
+        out["acc_tr"] = accuracy_score(y_tr, pred_tr)
+        out["acc_te"] = accuracy_score(y_te, pred_te)
+        out["f1_tr"] = f1_score(y_tr, pred_tr, average="macro")
+        out["f1_te"] = f1_score(y_te, pred_te, average="macro")
+        labels = sorted(pd.Series(y_te).astype(str).unique())
+        cm = confusion_matrix(y_te.astype(str), pd.Series(pred_te).astype(str), labels=labels)
+        out["labels"] = labels
+        out["cm"] = cm
+        out["y_te"] = y_te
+        out["pred_te"] = pred_te
+        # Errores frecuentes (pares real→pred)
+        cm_df = pd.DataFrame(cm, index=labels, columns=labels)
+        errs = []
+        for r in labels:
+            for p in labels:
+                if r != p:
+                    val = int(cm_df.loc[r, p])
+                    if val > 0:
+                        errs.append((r, p, val))
+        out["top_errors"] = sorted(errs, key=lambda x: x[2], reverse=True)[:5]
+
+    else:
+        out["mae"] = mean_absolute_error(y_te, pred_te)
+        out["rmse"] = mean_squared_error(y_te, pred_te, squared=False)
+        out["r2"] = r2_score(y_te, pred_te)
+        # baseline ingenuo (media entreno)
+        baseline = np.full_like(y_te, fill_value=np.mean(y_tr), dtype=float)
+        out["rmse_baseline"] = mean_squared_error(y_te, baseline, squared=False)
+        out["y_te"] = y_te
+        out["pred_te"] = pred_te
+        resid = y_te - pred_te
+        out["resid_mean"] = float(np.mean(resid))
+        out["resid_p95"] = float(np.percentile(np.abs(resid), 95))
+
+    # Importancias por permutación (en espacio original)
+    out["perm_importance"] = compute_perm_importance(pipe, X_te, y_te, tarea, topk=8)
+    return out
+
+def ml_key_insights(ml: Dict, X_te: pd.DataFrame) -> List[str]:
+    bullets = []
+    ntest = len(ml["y_te"])
+    bullets.append(f"Evaluación en test con {ntest} muestras.")
+
+    if ml["tarea"] == "clasificación":
+        bullets.append(f"Accuracy={ml['acc_te']:.3f}, F1-macro={ml['f1_te']:.3f}. "
+                       f"(train acc={ml['acc_tr']:.3f}, f1={ml['f1_tr']:.3f})")
+        # Balance de clases reales
+        dist = pd.Series(ml["y_te"]).astype(str).value_counts(normalize=True)
+        maj = dist.idxmax()
+        bullets.append(f"Clase mayoritaria en test: {maj} ({dist.max()*100:.1f}%).")
+        # Errores frecuentes
+        if ml.get("top_errors"):
+            top = ", ".join([f"{r}→{p}:{n}" for r,p,n in ml["top_errors"][:3]])
+            bullets.append(f"Errores frecuentes (real→pred): {top}.")
+    else:
+        bullets.append(f"MAE={ml['mae']:.3f}, RMSE={ml['rmse']:.3f}, R²={ml['r2']:.3f}. "
+                       f"RMSE baseline(media)={ml['rmse_baseline']:.3f}.")
+
+        # Resumen de residuales
+        bullets.append(f"Residuo medio ≈ {ml['resid_mean']:.3f}; p95(|resid|) ≈ {ml['resid_p95']:.3f}.")
+
+    # Importancias
+    imp = ml["perm_importance"]
+    if not imp.empty:
+        top_feats = ", ".join(f"{row.feature}({row.importance:.3f})" for _, row in imp.head(5).iterrows())
+        bullets.append("Features más influyentes (perm.): " + top_feats)
+    return bullets
+
+def ml_objective_interpretation(ml: Dict) -> str:
+    """Texto breve, determinístico, en español, basado solo en métricas/artefactos."""
+    if ml["tarea"] == "clasificación":
+        acc, f1 = ml["acc_te"], ml["f1_te"]
+        acc_tr, f1_tr = ml["acc_tr"], ml["f1_tr"]
+        gap = (acc_tr - acc) + (f1_tr - f1)
+        msg = [f"El baseline de clasificación muestra Accuracy={acc:.3f} y F1-macro={f1:.3f} en test."]
+        if gap > 0.15:
+            msg.append("Existe indicio de sobreajuste (gap notable entre train y test).")
+        elif gap < -0.05:
+            msg.append("Rendimiento en test mejor que en train (posible subajuste o split favorable).")
+        else:
+            msg.append("Generalización razonable: métricas similares entre train y test.")
+        if ml.get("top_errors"):
+            r,p,n = ml["top_errors"][0]
+            msg.append(f"Error más frecuente: {r}→{p} (conteo={n}). Conviene revisar separación entre estas clases.")
+        return " ".join(msg)
+    else:
+        rmse, r2, base = ml["rmse"], ml["r2"], ml["rmse_baseline"]
+        msg = [f"El baseline de regresión obtiene RMSE={rmse:.3f} y R²={r2:.3f}."]
+        if rmse < base:
+            msg.append(f"Mejora respecto al baseline ingenuo (RMSE media={base:.3f}).")
+        else:
+            msg.append(f"No mejora al baseline ingenuo (RMSE media={base:.3f}); conviene ajustar features/modelo.")
+        if abs(ml["resid_mean"]) > 0.1*rmse:
+            msg.append("Sesgo en residuales (media distinta de 0): revisar especificación del modelo.")
+        return " ".join(msg)
+
+# ===================== LLM Groq =====================
+def llm_status_badge(model_id: str, temp: float, max_tokens: int, key_ok: bool) -> str:
+    if key_ok and GROQ_OK:
+        return f"🟢 **Groq conectado** — modelo: `{model_id}` · temp={temp} · máx_tokens={max_tokens}"
+    elif not GROQ_OK:
+        return "🔴 Groq SDK no instalado. Agrega `groq` a requirements.txt."
+    return "🟠 Falta `GROQ_API_KEY` en *Secrets*."
+
+class GroqLLM:
+    """Cliente Groq con modo normal y streaming."""
+    def __init__(self, model_id: str, api_key: Optional[str], temp: float = 0.2, max_tokens: int = 350):
+        self.model = model_id
+        self.key = api_key
+        self.temp = float(temp)
+        self.max_tokens = int(max_tokens)
 
     def available(self) -> bool:
-        if self.backend == "api":
-            return bool(self.hf_token)
-        if self.backend == "groq":
-            return GROQ_OK and bool(self.groq_key)
-        return TRANSFORMERS_OK  # local
+        return bool(self.key) and GROQ_OK
 
-    def _human_error(self, status: int, body_text: str) -> str:
-        msg = (body_text or "")[:400]
-        if status == 401:
-            return "⚠️ 401 No autorizado: revisa token/credenciales."
-        if status == 403:
-            return (
-                "⚠️ 403 Prohibido: el recurso es privado o requiere aceptar términos.\n"
-                "Soluciones:\n"
-                "1) Usa una clave con acceso.\n"
-                "2) En la página del modelo/servicio, solicita o acepta acceso.\n"
-                "3) Prueba un modelo público desde el selector.\n"
-                f"Detalle: {msg}"
-            )
-        if status == 404:
-            return "⚠️ 404 No encontrado: revisa el nombre del modelo."
-        if status == 429:
-            return "⚠️ 429 Rate limit: intenta de nuevo en breve."
-        if status == 503:
-            return "⚠️ 503 Servicio inicializándose o no disponible temporalmente."
-        return f"⚠️ Error HTTP {status}: {msg}"
-
-    # --------- Modo no-stream (todos los backends) ---------
     def ask(self, system_prompt: str, user_prompt: str) -> str:
-        temp = float(st.session_state.get("llm_temp", 0.2))
-        max_tokens = int(st.session_state.get("llm_max_tokens", 350))
-
-        # Groq (no-stream)
-        if self.backend == "groq":
-            if not GROQ_OK:
-                return "⚠️ Groq SDK no instalado. Agrega `groq` a requirements.txt."
-            if not self.groq_key:
-                return "⚠️ Groq API: configura `GROQ_API_KEY` en Secrets."
-            try:
-                client = Groq(api_key=self.groq_key)
-                rsp = client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=temp,
-                    # En Groq la doc usa max_completion_tokens
-                    max_completion_tokens=max_tokens,
-                )
-                return (rsp.choices[0].message.content or "").strip()
-            except Exception as e:
-                return f"⚠️ Error Groq API: {e}"
-
-        # Local
-        if self.backend == "local":
-            if not TRANSFORMERS_OK:
-                return "⚠️ Backend local no disponible: instala transformers/tokenizers/torch."
-            try:
-                prompt = f"Sistema: {system_prompt}\n\nUsuario: {user_prompt}\n\nAsistente:"
-                tok, mdl = load_local_model(self.model, self.hf_token)
-                out = local_generate(tok, mdl, prompt, max_new_tokens=max_tokens, temperature=temp)
-                return out.strip()
-            except Exception as e:
-                return f"⚠️ Error en backend local: {e}"
-
-        # HF API
-        if not self.hf_token:
-            lines = [ln for ln in system_prompt.splitlines()
-                     if any(tok in ln.lower() for tok in user_prompt.lower().split()[:5])]
-            if not lines:
-                lines = system_prompt.splitlines()[:15]
-            return "Modo sin token para API. Activa 'Local' o configura HF_TOKEN. Contexto EDA:\n\n" + "\n".join(lines[:40])
-
-        headers = {"Authorization": f"Bearer {self.hf_token}", "Accept": "application/json"}
-        prompt = f"Sistema: {system_prompt}\n\nUsuario: {user_prompt}\n\nAsistente:"
-        payload = {
-            "inputs": prompt,
-            "parameters": {"max_new_tokens": max_tokens, "temperature": temp},
-            "options": {"wait_for_model": True, "use_cache": True}
-        }
-        url = f"https://api-inference.huggingface.co/models/{self.model}"
-
+        if not self.available():
+            return "⚠️ Groq: configura `GROQ_API_KEY` en Secrets."
         try:
-            r = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
-        except requests.exceptions.RequestException as e:
-            return f"⚠️ Error de red al llamar a HF Inference: {e}"
-        if r.status_code != 200:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            return self._human_error(r.status_code, err)
+            client = Groq(api_key=self.key)
+            rsp = client.chat.completions.create(
+                model=self.model,
+                messages=[{"role":"system","content":system_prompt},
+                          {"role":"user","content":user_prompt}],
+                temperature=self.temp,
+                max_completion_tokens=self.max_tokens,
+            )
+            return (rsp.choices[0].message.content or "").strip()
+        except Exception as e:
+            return f"⚠️ Error Groq API: {e}"
 
-        try:
-            data = r.json()
-        except ValueError:
-            return "⚠️ La respuesta de HF no es JSON válido."
-        if isinstance(data, list) and data and "generated_text" in data[0]:
-            text = data[0]["generated_text"]
-            return text.split("Asistente:", 1)[-1].strip()
-        if isinstance(data, dict) and "error" in data:
-            return self._human_error(500, data["error"])
-        return str(data)[:1000]
-
-    # --------- Streaming SOLO para Groq ---------
     def ask_stream(self, system_prompt: str, user_prompt: str):
-        """Generador que rinde textos incrementales (para Streamlit) usando Groq stream=True."""
-        temp = float(st.session_state.get("llm_temp", 0.2))
-        max_tokens = int(st.session_state.get("llm_max_tokens", 350))
-        if self.backend != "groq":
-            # Fallback: yield la respuesta normal de ask()
-            yield self.ask(system_prompt, user_prompt)
-            return
-        if not GROQ_OK:
-            yield "⚠️ Groq SDK no instalado. Agrega `groq` a requirements.txt."
-            return
-        if not self.groq_key:
-            yield "⚠️ Groq API: configura `GROQ_API_KEY` en Secrets."
+        """Genera texto incremental (streaming)."""
+        if not self.available():
+            yield "⚠️ Groq: configura `GROQ_API_KEY` en Secrets."
             return
         try:
-            client = Groq(api_key=self.groq_key)
+            client = Groq(api_key=self.key)
             stream = client.chat.completions.create(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=temp,
-                max_completion_tokens=max_tokens,   # ver docs
-                stream=True,                        # ← clave para streaming
+                messages=[{"role":"system","content":system_prompt},
+                          {"role":"user","content":user_prompt}],
+                temperature=self.temp,
+                max_completion_tokens=self.max_tokens,
+                stream=True,
             )
             for chunk in stream:
                 delta = getattr(chunk.choices[0].delta, "content", None)
@@ -366,7 +333,7 @@ class TinyLLM:
         except Exception as e:
             yield f"⚠️ Error Groq API (stream): {e}"
 
-# ===================== Sidebar (carga, apariencia, LLM) =====================
+# ===================== Sidebar (carga, apariencia, Groq) =====================
 with st.sidebar:
     st.header("1) Cargar datos")
     up = st.file_uploader("Sube un CSV", type=["csv"])
@@ -376,35 +343,18 @@ with st.sidebar:
     tema_oscuro = st.toggle("Modo oscuro (gráficas)", value=False)
     PLOTLY_TEMPLATE = "plotly_dark" if tema_oscuro else "plotly"
 
-    st.header("3) LLM (backend y modelo)")
-    backend = st.radio(
-        "Backend de LLM",
-        ["API (HF Inference)", "Groq API (stream)", "Local (transformers/tokenizers)"],
-        index=0,
-        help="HF = HTTP con HF_TOKEN · Groq = SDK con GROQ_API_KEY (stream) · Local = modelo en este servidor."
-    )
-    st.session_state["llm_backend"] = "groq" if "Groq" in backend else ("local" if backend.startswith("Local") else "api")
-
-    if st.session_state["llm_backend"] == "groq":
-        modelo_key = st.selectbox("Modelo (Groq):", options=list(GROQ_MODEL_CATALOG.keys()), index=0)
-        modelo_id = GROQ_MODEL_CATALOG[modelo_key]
-        custom_id = st.text_input("Modelo personalizado Groq (opcional)", value="")
-    else:
-        modelo_key = st.selectbox("Modelo (HF/Local):", options=list(HF_MODEL_CATALOG.keys()), index=0)
-        modelo_id = HF_MODEL_CATALOG[modelo_key]
-        custom_id = st.text_input("Modelo personalizado HF (opcional)", value="")
+    st.header("3) LLM (Groq)")
+    modelo_key = st.selectbox("Modelo (Groq):", options=list(GROQ_MODEL_CATALOG.keys()), index=0)
+    modelo_id = GROQ_MODEL_CATALOG[modelo_key]
+    custom_id = st.text_input("Modelo personalizado (opcional)", value="")
     if custom_id.strip():
         modelo_id = custom_id.strip()
-
     st.session_state["llm_model_id"] = modelo_id
     st.caption(f"Usando: `{modelo_id}`")
 
-    st.markdown("**Parámetros del modelo**")
-    st.session_state["llm_temp"] = st.slider("Temperatura", 0.0, 1.0, st.session_state.get("llm_temp", 0.2), 0.05,
-                                             help="Menor = más determinista.")
-    st.session_state["llm_max_tokens"] = st.slider("Máx. tokens de salida", 50, 800,
-                                                   st.session_state.get("llm_max_tokens", 350), 10,
-                                                   help="Respuesta más corta o más larga.")
+    st.markdown("**Parámetros**")
+    st.session_state["llm_temp"] = st.slider("Temperatura", 0.0, 1.0, st.session_state.get("llm_temp", 0.2), 0.05)
+    st.session_state["llm_max_tokens"] = st.slider("Máx. tokens de salida", 50, 800, st.session_state.get("llm_max_tokens", 350), 10)
 
 # ===================== Cargar datos =====================
 if up is not None:
@@ -423,7 +373,7 @@ st.dataframe(df.head(), use_container_width=True)
 eda = basic_eda(df)
 
 # ===================== Pestañas =====================
-tab_eda, tab_ml, tab_chat, tab_export = st.tabs(["📊 EDA", "🤖 ML", "💬 Chat", "📥 Exportar"])
+tab_eda, tab_ml, tab_chat, tab_demo, tab_export = st.tabs(["📊 EDA", "🤖 ML", "💬 Chat", "🔬 Demo EDA→ML→LLM", "📥 Exportar"])
 
 # ------------------------------- EDA TAB -------------------------------
 with tab_eda:
@@ -444,10 +394,7 @@ with tab_eda:
         st.write("**Faltantes por columna**")
         st.dataframe(miss_tbl, use_container_width=True, height=260)
         if PLOTLY_OK:
-            st.plotly_chart(
-                px.bar(miss_tbl, x="columna", y="faltantes_%", title="% faltantes", template=PLOTLY_TEMPLATE),
-                use_container_width=True
-            )
+            st.plotly_chart(px.bar(miss_tbl, x="columna", y="faltantes_%", title="% faltantes", template=PLOTLY_TEMPLATE), use_container_width=True)
         else:
             st.warning(f"Plotly no disponible: {PX_ERR}")
 
@@ -468,22 +415,19 @@ with tab_eda:
     with st.expander("Distribuciones numéricas (hasta 6) con box marginal"):
         if PLOTLY_OK:
             for c in num_cols[:6]:
-                st.plotly_chart(px.histogram(df, x=c, nbins=40, title=c, marginal="box",
-                                             template=PLOTLY_TEMPLATE), use_container_width=True)
+                st.plotly_chart(px.histogram(df, x=c, nbins=40, title=c, marginal="box", template=PLOTLY_TEMPLATE), use_container_width=True)
 
     with st.expander("Frecuencias categóricas (hasta 6)"):
         if PLOTLY_OK:
             for c in cat_cols[:6]:
                 vc = df[c].astype(str).value_counts(dropna=False).head(20).reset_index()
                 vc.columns = [c, "conteo"]
-                st.plotly_chart(px.bar(vc, x=c, y="conteo", title=c, template=PLOTLY_TEMPLATE),
-                                use_container_width=True)
+                st.plotly_chart(px.bar(vc, x=c, y="conteo", title=c, template=PLOTLY_TEMPLATE), use_container_width=True)
 
     if len(num_cols) >= 2 and PLOTLY_OK:
         st.subheader("Matriz de correlación (subset numérico)")
         corr = df[num_cols[:12]].corr(numeric_only=True)
-        st.plotly_chart(px.imshow(corr, text_auto=False, aspect="auto", title="Correlaciones",
-                                  template=PLOTLY_TEMPLATE), use_container_width=True)
+        st.plotly_chart(px.imshow(corr, text_auto=False, aspect="auto", title="Correlaciones", template=PLOTLY_TEMPLATE), use_container_width=True)
 
     posibles_targets = [c for c in df.columns if c.lower() in ("etiqueta","label","target")]
     target_sugerido = posibles_targets[0] if posibles_targets else None
@@ -493,15 +437,11 @@ with tab_eda:
     if col_tar != "(ninguna)" and PLOTLY_OK:
         bal = df[col_tar].astype(str).value_counts(dropna=False).reset_index()
         bal.columns = [col_tar, "conteo"]
-        st.plotly_chart(px.bar(bal, x=col_tar, y="conteo", title="Balance de clases",
-                               template=PLOTLY_TEMPLATE), use_container_width=True)
+        st.plotly_chart(px.bar(bal, x=col_tar, y="conteo", title="Balance de clases", template=PLOTLY_TEMPLATE), use_container_width=True)
         for c in num_cols[:3]:
-            st.plotly_chart(px.violin(df, x=col_tar, y=c, box=True, points="outliers",
-                                      title=f"{c} por {col_tar}", template=PLOTLY_TEMPLATE), use_container_width=True)
+            st.plotly_chart(px.violin(df, x=col_tar, y=c, box=True, points="outliers", title=f"{c} por {col_tar}", template=PLOTLY_TEMPLATE), use_container_width=True)
         if len(num_cols) >= 2:
-            st.plotly_chart(px.scatter(df, x=num_cols[0], y=num_cols[1], color=col_tar,
-                                       title=f"{num_cols[0]} vs {num_cols[1]} por {col_tar}",
-                                       template=PLOTLY_TEMPLATE), use_container_width=True)
+            st.plotly_chart(px.scatter(df, x=num_cols[0], y=num_cols[1], color=col_tar, title=f"{num_cols[0]} vs {num_cols[1]} por {col_tar}", template=PLOTLY_TEMPLATE), use_container_width=True)
 
 # ------------------------------- ML TAB -------------------------------
 with tab_ml:
@@ -523,69 +463,81 @@ with tab_ml:
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42, stratify=estrat)
 
     if st.button("Entrenar baseline"):
-        pipe.fit(X_tr, y_tr)
-        pred = pipe.predict(X_te)
+        ml_art = ml_metrics_and_artifacts(pipe, X_tr, X_te, y_tr, y_te, tarea)
+        st.session_state["ml"] = {
+            "pipeline": pipe,
+            "X_te": X_te,
+            "y_te": y_te,
+            **ml_art
+        }
 
+    # Mostrar resultados si existen
+    if "ml" in st.session_state and st.session_state["ml"]["tarea"] == tarea:
+        ml = st.session_state["ml"]
         if tarea == "clasificación":
-            acc = accuracy_score(y_te, pred)
-            f1m = f1_score(y_te, pred, average="macro")
-            st.write(f"**Accuracy:** {acc:.3f} | **F1-macro:** {f1m:.3f}")
+            st.write(f"**Accuracy (test):** {ml['acc_te']:.3f} | **F1-macro (test):** {ml['f1_te']:.3f} "
+                     f"(train: acc={ml['acc_tr']:.3f}, f1={ml['f1_tr']:.3f})")
 
             if PLOTLY_OK:
-                etiquetas = sorted(pd.Series(y_te).astype(str).unique())
-                cm = confusion_matrix(y_te, pred, labels=etiquetas)
-                fig_cm = px.imshow(cm, x=etiquetas, y=etiquetas, text_auto=True,
-                                   color_continuous_scale="Blues", title="Matriz de confusión",
-                                   template=PLOTLY_TEMPLATE)
+                etiquetas = ml["labels"]
+                cm = ml["cm"]
+                fig_cm = px.imshow(cm, x=etiquetas, y=etiquetas, text_auto=True, color_continuous_scale="Blues",
+                                   title="Matriz de confusión", template=PLOTLY_TEMPLATE)
                 fig_cm.update_layout(xaxis_title="Predicha", yaxis_title="Real")
                 st.plotly_chart(fig_cm, use_container_width=True)
 
         else:
-            mae = mean_absolute_error(y_te, pred)
-            rmse = mean_squared_error(y_te, pred, squared=False)
-            r2 = r2_score(y_te, pred)
-            st.write(f"**MAE:** {mae:.3f} | **RMSE:** {rmse:.3f} | **R²:** {r2:.3f}")
+            st.write(f"**MAE:** {ml['mae']:.3f} | **RMSE:** {ml['rmse']:.3f} | **R²:** {ml['r2']:.3f} "
+                     f"| **RMSE baseline(media):** {ml['rmse_baseline']:.3f}")
 
             if PLOTLY_OK:
-                resid = y_te - pred
-                st.plotly_chart(px.scatter(x=pred, y=resid, labels={"x":"Predicción", "y":"Residual"},
-                                           title="Predicción vs Residual", template=PLOTLY_TEMPLATE),
-                                use_container_width=True)
+                resid = ml["y_te"] - ml["pred_te"]
+                st.plotly_chart(px.scatter(x=ml["pred_te"], y=resid, labels={"x":"Predicción","y":"Residual"},
+                                           title="Predicción vs Residual", template=PLOTLY_TEMPLATE), use_container_width=True)
                 st.plotly_chart(px.histogram(resid, nbins=40, title="Histograma de residuales",
                                              template=PLOTLY_TEMPLATE), use_container_width=True)
 
-# ------------------------------- CHAT TAB -------------------------------
+        # Importancias (perm)
+        imp = ml["perm_importance"]
+        st.write("**Importancias por permutación (top):**")
+        st.dataframe(imp, use_container_width=True, height=240)
+        if PLOTLY_OK and not imp.empty:
+            st.plotly_chart(px.bar(imp, x="feature", y="importance", error_y="std", title="Importancia (perm)",
+                                   template=PLOTLY_TEMPLATE), use_container_width=True)
+
+        st.info(ml_objective_interpretation(ml))
+
+# ------------------------------- CHAT TAB (Groq con streaming) -------------------------------
 with tab_chat:
-    st.subheader("Chat en español")
+    st.subheader("Chat en español (Groq)")
 
-    llm = TinyLLM()
-    st.info(llm_status_badge(llm))
+    model_id = st.session_state.get("llm_model_id") or "llama-3.1-8b-instant"
+    api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
+    temp = float(st.session_state.get("llm_temp", 0.2))
+    max_tokens = int(st.session_state.get("llm_max_tokens", 350))
+    groq = GroqLLM(model_id=model_id, api_key=api_key, temp=temp, max_tokens=max_tokens)
 
-    cols = st.columns([1, 1, 2])
-    with cols[0]:
-        if st.button("Probar conexión LLM"):
-            # Para Groq, hace una llamada normal (no-stream) cortita
-            test_resp = llm.ask("Eres un sistema de prueba.", "Di 'ok' en una palabra.")
-            st.write("**Respuesta de prueba:**", (test_resp or "")[:500])
-    with cols[1]:
-        back = {"api": "HF Inference", "groq": "Groq API (stream)", "local": "Local/transformers"}[llm.backend]
-        st.write(f"**Backend:** {back}")
-        st.write(f"**Modelo:** `{llm.model}`")
+    st.info(llm_status_badge(model_id, temp, max_tokens, key_ok=bool(api_key)))
 
-    # Historial de chat
     if "mensajes" not in st.session_state:
         st.session_state.mensajes = [{"role":"assistant",
-                                      "content":"Hola 👋 Puedo responder en español sobre tu dataset y genética básica. ¿Qué quieres saber?"}]
+                                      "content":"Hola 👋 Puedo responder en español sobre tu dataset, el EDA y el baseline ML. ¿Qué quieres saber?"}]
     for m in st.session_state.mensajes:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
 
-    # Contexto EDA -> sistema
+    # Construir contexto con EDA + (si existe) resumen ML
     eda_resumen = eda_summary_text(eda, df)
+    ml_text = ""
+    if "ml" in st.session_state:
+        ml = st.session_state["ml"]
+        ml_ins = ml_key_insights(ml, st.session_state["ml"]["X_te"])
+        ml_text = "INSIGHTS DE ML:\n" + "\n".join(f"- {b}" for b in ml_ins) + "\n"
+
     sistema = (
         "Eres un asistente de datos genéticos. Responde en **español**, breve y conservador. "
-        "No des consejo médico. Usa el EDA cuando aplique.\n\n"
-        f"CONTEXTO EDA:\n{eda_resumen}\n"
+        "No des consejo médico. Cita cifras solo si están en el contexto.\n\n"
+        f"RESUMEN EDA:\n{eda_resumen}\n\n{ml_text}"
     )
 
     pregunta = st.chat_input("Escribe tu pregunta…")
@@ -594,36 +546,125 @@ with tab_chat:
         with st.chat_message("user"):
             st.markdown(pregunta)
 
-        # Streaming si backend = Groq; si no, respuesta normal
-        if llm.backend == "groq":
-            full = ""
-            with st.chat_message("assistant"):
-                placeholder = st.empty()
-                for delta in llm.ask_stream(sistema, pregunta):
-                    full += delta
-                    placeholder.markdown(full)
-            st.session_state.mensajes.append({"role":"assistant", "content":full})
-        else:
-            respuesta = llm.ask(sistema, pregunta)
+        # Streaming
+        full = ""
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            for delta in groq.ask_stream(sistema, pregunta):
+                full += delta
+                placeholder.markdown(full)
+        st.session_state.mensajes.append({"role":"assistant", "content":full})
 
-            # Atajos si falla HF/Groq
-            if isinstance(respuesta, str) and ("Groq API" in respuesta or "HF_TOKEN" in respuesta or respuesta.startswith("⚠️ 403")):
-                st.warning("Revisa las credenciales/permisos o cambia a un modelo público.")
-                cA, cB = st.columns(2)
-                with cA:
-                    if st.button("Usar TinyLlama (HF)"):
-                        st.session_state["llm_backend"] = "api"
-                        st.session_state["llm_model_id"] = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-                        st.experimental_rerun()
-                with cB:
-                    if st.button("Usar Llama 3.1 8B (Groq)"):
-                        st.session_state["llm_backend"] = "groq"
-                        st.session_state["llm_model_id"] = "llama-3.1-8b-instant"
-                        st.experimental_rerun()
+# ------------------------------- DEMO TAB (EDA→ML→LLM) -------------------------------
+with tab_demo:
+    st.subheader("Demostración: ¿el LLM usa los insights del EDA y del ML?")
 
-            st.session_state.mensajes.append({"role":"assistant", "content":respuesta})
-            with st.chat_message("assistant"):
-                st.markdown(respuesta)
+    # 1) Insights EDA
+    posibles_targets = [c for c in df.columns if c.lower() in ("etiqueta","label","target")]
+    target_sugerido = posibles_targets[0] if posibles_targets else None
+    target_for_insights = st.selectbox(
+        "Columna de etiqueta (opcional, para enriquecer insights EDA):",
+        options=["(ninguna)"] + list(df.columns),
+        index=(list(df.columns).index(target_sugerido)+1 if target_sugerido in df.columns else 0)
+    )
+    if target_for_insights == "(ninguna)":
+        target_for_insights = None
+    insights_eda = eda_key_insights(eda, df, target_guess=target_for_insights)
+    st.markdown("**Insights del EDA:**")
+    st.markdown("\n".join(f"- {b}" for b in insights_eda))
+
+    # 2) Insights ML (si ya entrenaste)
+    ml_insights = []
+    ml_interp_txt = ""
+    if "ml" in st.session_state:
+        ml = st.session_state["ml"]
+        ml_insights = ml_key_insights(ml, ml["X_te"])
+        ml_interp_txt = ml_objective_interpretation(ml)
+        st.markdown("**Insights del baseline ML:**")
+        st.markdown("\n".join(f"- {b}" for b in ml_insights))
+        st.success(f"**Interpretación objetiva (automática):** {ml_interp_txt}")
+    else:
+        st.warning("Entrena el baseline en la pestaña **ML** para habilitar insights de ML en esta demo.")
+
+    st.divider()
+
+    # 3) Pregunta de prueba y prompts
+    pregunta_demo = st.text_input(
+        "Pregunta para comparar respuestas (ideal: algo que se beneficie de EDA y ML):",
+        value="¿Qué problemas de calidad ves, qué variables parecen influyentes y cómo interpretarías el rendimiento del modelo?"
+    )
+
+    sistema_sin = (
+        "Eres un asistente de datos genéticos. Responde en español, breve y conservador. "
+        "Si te falta contexto, dilo explícitamente."
+    )
+    sistema_con_eda = (
+        "Eres un asistente de datos genéticos. Responde en español, breve y conservador. "
+        "Usa EXCLUSIVAMENTE los INSIGHTS EDA para cifras del dataset. Si falta, dilo.\n\n"
+        "INSIGHTS EDA:\n" + "\n".join(f"- {b}" for b in insights_eda)
+    )
+    sistema_eda_ml = (
+        "Eres un asistente de datos genéticos. Responde en español, breve y conservador. "
+        "Cuando cites cifras del dataset o del modelo, usa EXCLUSIVAMENTE los bloques de INSIGHTS. "
+        "Incluye una interpretación del rendimiento del modelo basada en dichas métricas.\n\n"
+        "INSIGHTS EDA:\n" + "\n".join(f"- {b}" for b in insights_eda) + "\n\n" +
+        ("INSIGHTS ML:\n" + "\n".join(f"- {b}" for b in ml_insights) + "\nInterpretación ML (objetiva): " + ml_interp_txt
+         if ml_insights else "INSIGHTS ML: (no disponibles)")
+    )
+
+    colA, colB, colC = st.columns(3)
+
+    model_id = st.session_state.get("llm_model_id") or "llama-3.1-8b-instant"
+    api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
+    temp = float(st.session_state.get("llm_temp", 0.2))
+    max_tokens = int(st.session_state.get("llm_max_tokens", 350))
+    groq_demo = GroqLLM(model_id=model_id, api_key=api_key, temp=temp, max_tokens=max_tokens)
+
+    with colA:
+        st.write("### 🔵 Sin contexto")
+        if st.button("Generar SIN contexto"):
+            resp = groq_demo.ask(sistema_sin, pregunta_demo)
+            st.markdown(resp)
+
+    with colB:
+        st.write("### 🟢 Con EDA")
+        if st.button("Generar con EDA"):
+            resp = groq_demo.ask(sistema_con_eda, pregunta_demo)
+            st.markdown(resp)
+
+    with colC:
+        st.write("### 🟣 Con EDA + ML")
+        if st.button("Generar con EDA + ML"):
+            resp = groq_demo.ask(sistema_eda_ml, pregunta_demo)
+            st.markdown(resp)
+
+    st.divider()
+    st.write("### ✅ Evidencia de uso del contexto (heurística textual)")
+    resp_eval = st.text_area("Pega aquí una respuesta del LLM (idealmente la de EDA+ML) para evaluarla:")
+    if resp_eval:
+        checks = {}
+        nrows, ncols = eda["shape"]
+        checks["Menciona #filas"] = str(nrows) in resp_eval
+        missing = pd.Series(eda["null_pct"]).sort_values(ascending=False)
+        top_missing_names = [str(k).lower() for k in missing[missing > 0].head(3).index]
+        checks["Cita columnas con más nulos (EDA)"] = any(name in resp_eval.lower() for name in top_missing_names)
+        # Señales ML
+        if "ml" in st.session_state:
+            ml = st.session_state["ml"]
+            if ml["tarea"] == "clasificación":
+                checks["Cita métricas ML (acc/f1)"] = ("accuracy" in resp_eval.lower() or "f1" in resp_eval.lower())
+                if ml.get("top_errors"):
+                    r,p,_ = ml["top_errors"][0]
+                    checks["Menciona error frecuente real→pred"] = (f"{r}" in resp_eval and f"{p}" in resp_eval)
+            else:
+                checks["Cita métricas ML (RMSE/R²/MAE)"] = ("rmse" in resp_eval.lower() or "r²" in resp_eval.lower() or "mae" in resp_eval.lower())
+            imp = ml["perm_importance"]
+            if not imp.empty:
+                any_feat = any(str(f).lower() in resp_eval.lower() for f in imp["feature"].head(5))
+                checks["Menciona features influyentes (perm)"] = any_feat
+
+        for k, v in checks.items():
+            st.write(("✅ " if v else "⚠️ ") + k)
 
 # ------------------------------- EXPORT TAB -------------------------------
 with tab_export:
@@ -636,18 +677,15 @@ with tab_export:
                        file_name="resumen_eda.md", mime="text/markdown")
 
     st.write("**Tablas clave:**")
-    if 'miss_tbl' not in locals():
-        miss_tbl = pd.DataFrame({
-            "columna": list(eda["null_counts"].keys()),
-            "faltantes": list(eda["null_counts"].values()),
-            "faltantes_%": list(eda["null_pct"].values())
-        }).sort_values("faltantes_%", ascending=False)
-
+    miss_tbl = pd.DataFrame({
+        "columna": list(eda["null_counts"].keys()),
+        "faltantes": list(eda["null_counts"].values()),
+        "faltantes_%": list(eda["null_pct"].values())
+    }).sort_values("faltantes_%", ascending=False)
     st.download_button("⬇️ faltantes.csv", data=miss_tbl.to_csv(index=False).encode("utf-8"),
                        file_name="faltantes.csv", mime="text/csv")
 
     num_desc = eda["desc_num"]
     if not num_desc.empty:
-        st.download_button("⬇️ descriptivos_numericos.csv",
-                           data=num_desc.to_csv(index=True).encode("utf-8"),
+        st.download_button("⬇️ descriptivos_numericos.csv", data=num_desc.to_csv(index=True).encode("utf-8"),
                            file_name="descriptivos_numericos.csv", mime="text/csv")
