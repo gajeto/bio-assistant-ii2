@@ -232,4 +232,50 @@ def ml_key_insights(ml: Dict, X_te: pd.DataFrame) -> list[str]:
         bullets.append(f"Clase mayoritaria en test: {maj} ({dist.max()*100:.1f}%).")
         if ml.get("top_errors"):
             top = ", ".join([f"{r}→{p}:{n}" for r, p, n in ml["top_errors"][:3]])
-            bullets.append(f"Errores f
+            bullets.append(f"Errores frecuentes (real→pred): {top}.")
+    else:
+        bullets.append(
+            f"MAE={ml['mae']:.3f}, RMSE={ml['rmse']:.3f}, R²={ml['r2']:.3f}. "
+            f"RMSE baseline(media)={ml['rmse_baseline']:.3f}."
+        )
+        bullets.append(
+            f"Residuo medio ≈ {ml['resid_mean']:.3f}; p95(|resid|) ≈ {ml['resid_p95']:.3f}."
+        )
+
+    imp = ml["perm_importance"]
+    if hasattr(imp, "empty") and not imp.empty:
+        top_feats = ", ".join(f"{row.feature}({row.importance:.3f})"
+                              for _, row in imp.head(5).iterrows())
+        bullets.append("Features más influyentes (perm.): " + top_feats)
+
+    return bullets
+
+
+def ml_objective_interpretation(ml: Dict) -> str:
+    """Resumen textual objetivo (no-LLM) de las métricas de ML."""
+    if ml["tarea"] == "clasificación":
+        acc, f1 = ml["acc_te"], ml["f1_te"]
+        acc_tr, f1_tr = ml["acc_tr"], ml["f1_tr"]
+        gap = (acc_tr - acc) + (f1_tr - f1)
+        msg = [f"El baseline de clasificación muestra Accuracy={acc:.3f} y F1-macro={f1:.3f} en test."]
+        if gap > 0.15:
+            msg.append("Existe indicio de sobreajuste (gap notable entre train y test).")
+        elif gap < -0.05:
+            msg.append("Rendimiento en test mejor que en train (posible subajuste o split favorable).")
+        else:
+            msg.append("Generalización razonable: métricas similares entre train y test.")
+        if ml.get("top_errors"):
+            r, p, n = ml["top_errors"][0]
+            msg.append(f"Error más frecuente: {r}→{p} (conteo={n}). Revisar separación entre estas clases.")
+        return " ".join(msg)
+
+    # Regresión
+    rmse, r2, base = ml["rmse"], ml["r2"], ml["rmse_baseline"]
+    msg = [f"El baseline de regresión obtiene RMSE={rmse:.3f} y R²={r2:.3f}."]
+    if rmse < base:
+        msg.append(f"Mejora respecto al baseline ingenuo (RMSE media={base:.3f}).")
+    else:
+        msg.append(f"No mejora al baseline ingenuo (RMSE media={base:.3f}); conviene ajustar features/modelo.")
+    if abs(ml["resid_mean"]) > 0.1 * rmse:
+        msg.append("Sesgo en residuales (media distinta de 0): revisar especificación del modelo.")
+    return " ".join(msg)
