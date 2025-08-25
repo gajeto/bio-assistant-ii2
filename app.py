@@ -1,8 +1,9 @@
+# app.py
 import os
 import numpy as np
 import pandas as pd
 import streamlit as st
-from typing import Dict, List
+from typing import Dict
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score, f1_score, mean_absolute_error, mean_squared_error, r2_score,
@@ -15,7 +16,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, LinearRegression
 import requests
 
-# —— Import Plotly (formato robusto) ——
+# —— Import Plotly (robusto) ——
 try:
     from plotly import express as px
     import plotly.graph_objects as go
@@ -27,9 +28,18 @@ except Exception as e:
 # ===================== Configuración de página =====================
 st.set_page_config(page_title="Asistente Genético (EDA + Chat)", page_icon="🧬", layout="wide")
 st.title("🧬 Asistente Genético: EDA + Chat LLM (ligero)")
-st.caption("Sube un CSV (hasta ~1.000 filas) → EDA enriquecido → Baseline ML → Chat en español. (Educativo; no es consejo médico).")
+st.caption("Sube un CSV (hasta ~1.000 filas) → EDA enriquecido → Baseline ML → Chat en español. "
+           "Herramienta educativa; **no** es consejo médico.")
 
-# ===================== Utilidades =====================
+# ===================== Catálogo de modelos LLM (ligeros) =====================
+MODEL_CATALOG = {
+    "TinyLlama 1.1B Chat (por defecto)": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "Llama 3.2 1B Instruct": "meta-llama/Llama-3.2-1B-Instruct",
+    "Qwen2.5 0.5B Instruct": "Qwen/Qwen2.5-0.5B-Instruct",
+    "Falcon 1B Instruct": "tiiuae/falcon-1b-instruct",
+}
+
+# ===================== Utilidades de datos =====================
 def load_csv(file) -> pd.DataFrame:
     try:
         return pd.read_csv(file)
@@ -105,7 +115,8 @@ def eda_summary_text(eda: Dict, df: pd.DataFrame, max_lines=80) -> str:
         lines.append("Resumen numérico (5 primeras):")
         for c in list(eda["desc_num"].index)[:5]:
             d = eda["desc_num"].loc[c]
-            lines.append(f"- {c}: media={d['mean']:.4f}, std={d['std']:.4f}, min={d['min']:.4f}, mediana={d['50%']:.4f}, max={d['max']:.4f}")
+            lines.append(f"- {c}: media={d['mean']:.4f}, std={d['std']:.4f}, "
+                         f"min={d['min']:.4f}, mediana={d['50%']:.4f}, max={d['max']:.4f}")
     return "\n".join(lines[:max_lines])
 
 def eda_summary_markdown(eda: Dict) -> str:
@@ -122,47 +133,106 @@ def eda_summary_markdown(eda: Dict) -> str:
         md.append("\n## Descriptivos numéricos (primeras 5 variables)")
         for c in list(eda["desc_num"].index)[:5]:
             d = eda["desc_num"].loc[c]
-            md.append(f"- **{c}** → media {d['mean']:.4f} | std {d['std']:.4f} | min {d['min']:.4f} | 50% {d['50%']:.4f} | max {d['max']:.4f}")
+            md.append(f"- **{c}** → media {d['mean']:.4f} | std {d['std']:.4f} | "
+                      f"min {d['min']:.4f} | 50% {d['50%']:.4f} | max {d['max']:.4f}")
     return "\n".join(md)
+
+# ===================== LLM: badge de estado =====================
+def llm_status_badge(llm: "TinyLLM") -> str:
+    if llm.available():
+        return f"🟢 **LLM conectado** — modelo: `{llm.model}` · temp={st.session_state.get('llm_temp',0.2)} · max_tokens={st.session_state.get('llm_max_tokens',350)}"
+    return "🔴 **LLM desconectado** — configura `HF_TOKEN` en *Secrets*."
 
 # =============== Cliente LLM (español, ligero, chat) ===============
 class TinyLLM:
     """
-    Modelo pequeño en HuggingFace Inference (por defecto TinyLlama 1.1B Chat).
-    Responde en español. Define HF_TOKEN en secretos/env. Cambio de modelo vía HF_MODEL.
+    Modelo pequeño en HuggingFace Inference.
+    - Lee HF_TOKEN de env o st.secrets.
+    - Usa HF_MODEL si está; si no, TinyLlama por defecto.
+    - Si hay st.session_state['hf_model_override'], prioriza ese.
+    - Manejo de errores HTTP en claro (401,403,404,429,503).
+    - Respeta temperatura y máx. tokens desde st.session_state.
     """
-    def __init__(self, model: str = None, timeout: int = 45):
-        self.model = model or os.environ.get("HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-        self.hf_token = os.environ.get("HF_TOKEN")
+    def __init__(self, model: str = None, timeout: int = 60):
+        def _get_secret(key, default=None):
+            val = os.environ.get(key)
+            if not val:
+                try:
+                    val = st.secrets.get(key, default)  # st ya importado
+                except Exception:
+                    val = default
+            return val
+
+        base_model = model or _get_secret("HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        pick = st.session_state.get("hf_model_override")
+        self.model = pick or base_model
+        self.hf_token = _get_secret("HF_TOKEN", None)
         self.timeout = timeout
 
     def available(self) -> bool:
         return bool(self.hf_token)
 
+    def _human_error(self, status: int, body_text: str) -> str:
+        msg = (body_text or "")[:400]
+        if status == 401:
+            return "⚠️ 401 No autorizado: revisa `HF_TOKEN`."
+        if status == 403:
+            return "⚠️ 403 Prohibido: modelo privado o sin permisos."
+        if status == 404:
+            return "⚠️ 404 No encontrado: revisa `HF_MODEL`/selector."
+        if status == 429:
+            return "⚠️ 429 Rate limit: intenta de nuevo en breve."
+        if status == 503:
+            return "⚠️ 503 Inicializando el modelo en HF; reintenta."
+        return f"⚠️ Error HTTP {status}: {msg}"
+
     def ask(self, system_prompt: str, user_prompt: str) -> str:
+        # Ajustes desde UI
+        temp = float(st.session_state.get("llm_temp", 0.2))
+        max_tokens = int(st.session_state.get("llm_max_tokens", 350))
+
+        # Sin token → modo offline con contexto EDA
         if not self.available():
             lines = [ln for ln in system_prompt.splitlines()
                      if any(tok in ln.lower() for tok in user_prompt.lower().split()[:5])]
             if not lines:
                 lines = system_prompt.splitlines()[:15]
             return "Modo sin LLM (no hay HF_TOKEN). Contexto EDA:\n\n" + "\n".join(lines[:40])
-        headers = {"Authorization": f"Bearer {self.hf_token}"}
+
+        headers = {"Authorization": f"Bearer {self.hf_token}", "Accept": "application/json"}
         prompt = f"Sistema: {system_prompt}\n\nUsuario: {user_prompt}\n\nAsistente:"
-        payload = {"inputs": prompt, "parameters": {"max_new_tokens": 350, "temperature": 0.2}}
-        r = requests.post(
-            f"https://api-inference.huggingface.co/models/{self.model}",
-            json=payload, headers=headers, timeout=self.timeout
-        )
-        r.raise_for_status()
-        data = r.json()
+        payload = {
+            "inputs": prompt,
+            "parameters": {"max_new_tokens": max_tokens, "temperature": temp},
+            "options": {"wait_for_model": True, "use_cache": True}
+        }
+        url = f"https://api-inference.huggingface.co/models/{self.model}"
+
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+        except requests.exceptions.RequestException as e:
+            return f"⚠️ Error de red al llamar a HF Inference: {e}"
+
+        if r.status_code != 200:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return self._human_error(r.status_code, err)
+
+        try:
+            data = r.json()
+        except ValueError:
+            return "⚠️ La respuesta de HF no es JSON válido."
+
         if isinstance(data, list) and data and "generated_text" in data[0]:
             text = data[0]["generated_text"]
             return text.split("Asistente:", 1)[-1].strip()
         if isinstance(data, dict) and "error" in data:
-            return f"[HF Inference Error] {data['error']}"
-        return str(data)
+            return self._human_error(500, data["error"])
+        return str(data)[:1000]
 
-# ===================== Sidebar (carga y opciones) =====================
+# ===================== Sidebar (carga, apariencia, LLM) =====================
 with st.sidebar:
     st.header("1) Cargar datos")
     up = st.file_uploader("Sube un CSV", type=["csv"])
@@ -173,8 +243,26 @@ with st.sidebar:
     PLOTLY_TEMPLATE = "plotly_dark" if tema_oscuro else "plotly"
 
     st.header("3) LLM (español, pequeño)")
-    st.write("Proveedor: HuggingFace Inference. Modelo por defecto: TinyLlama 1.1B Chat.")
-    st.caption("Configura `HF_TOKEN`. Cambia `HF_MODEL` si deseas otro LLM pequeño.")
+    st.write("Proveedor: HuggingFace Inference. Requiere `HF_TOKEN` en Secrets.")
+    modelo_key = st.selectbox(
+        "Modelo:",
+        options=list(MODEL_CATALOG.keys()),
+        index=0,
+        help="Elige un modelo liviano para preguntas en español."
+    )
+    modelo_id = MODEL_CATALOG[modelo_key]
+    custom_id = st.text_input("Modelo personalizado (opcional)", value="")
+    if custom_id.strip():
+        modelo_id = custom_id.strip()
+    st.session_state["hf_model_override"] = modelo_id
+
+    # Controles del modelo
+    st.markdown("**Parámetros del modelo**")
+    st.session_state["llm_temp"] = st.slider("Temperatura", 0.0, 1.0, st.session_state.get("llm_temp", 0.2), 0.05,
+                                             help="Menor = más determinista.")
+    st.session_state["llm_max_tokens"] = st.slider("Máx. tokens de salida", 50, 800,
+                                                   st.session_state.get("llm_max_tokens", 350), 10,
+                                                   help="Respuesta más corta o más larga.")
 
 # ===================== Cargar datos =====================
 if up is not None:
@@ -189,10 +277,10 @@ df = cap_rows(df, 1000)
 st.success(f"Datos cargados: {df.shape[0]} filas × {df.shape[1]} columnas")
 st.dataframe(df.head(), use_container_width=True)
 
-# ===================== EDA & estructuras base =====================
+# ===================== EDA base =====================
 eda = basic_eda(df)
 
-# Tab layout
+# ===================== Pestañas =====================
 tab_eda, tab_ml, tab_chat, tab_export = st.tabs(["📊 EDA", "🤖 ML", "💬 Chat", "📥 Exportar"])
 
 # ------------------------------- EDA TAB -------------------------------
@@ -327,15 +415,29 @@ with tab_ml:
 # ------------------------------- CHAT TAB -------------------------------
 with tab_chat:
     st.subheader("Chat en español")
+
+    # Estado del LLM y diagnóstico
+    llm = TinyLLM()
+    st.info(llm_status_badge(llm))
+
+    cols = st.columns([1, 1, 2])
+    with cols[0]:
+        if st.button("Probar conexión LLM"):
+            test_resp = llm.ask("Eres un sistema de prueba.", "Di 'ok' en una palabra.")
+            st.write("**Respuesta de prueba:**", test_resp[:500])
+    with cols[1]:
+        st.write(f"**Modelo activo:** `{llm.model}`")
+
+    # Historial de chat
     if "mensajes" not in st.session_state:
         st.session_state.mensajes = [{"role":"assistant",
-                                      "content":"Hola 👋 Soy tu asistente. Pregunta sobre tu dataset o genética básica."}]
+                                      "content":"Hola 👋 Puedo responder en español sobre tu dataset y genética básica. ¿Qué quieres saber?"}]
     for m in st.session_state.mensajes:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
 
+    # Contexto EDA -> sistema
     eda_resumen = eda_summary_text(eda, df)
-    llm = TinyLLM()
     sistema = (
         "Eres un asistente de datos genéticos. Responde en **español**, breve y conservador. "
         "No des consejo médico. Usa el EDA cuando aplique.\n\n"
@@ -362,7 +464,7 @@ with tab_export:
     st.download_button("⬇️ Descargar resumen_eda.md", data=md.encode("utf-8"),
                        file_name="resumen_eda.md", mime="text/markdown")
 
-    # Además, exportables en CSV
+    # Exportables en CSV
     st.write("**Tablas clave:**")
     if 'miss_tbl' not in locals():
         miss_tbl = pd.DataFrame({
