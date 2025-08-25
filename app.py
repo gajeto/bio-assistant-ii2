@@ -26,13 +26,19 @@ except Exception as e:
     PX_ERR = e
 
 # —— BACKEND LOCAL (transformers/tokenizers) ——
-# Si no vas a usar backend local, puedes comentar estas importaciones.
 try:
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
     TRANSFORMERS_OK = True
-except Exception as e:
+except Exception:
     TRANSFORMERS_OK = False
+
+# —— GROQ SDK ——
+try:
+    from groq import Groq
+    GROQ_OK = True
+except Exception:
+    GROQ_OK = False
 
 # ===================== Configuración de página =====================
 st.set_page_config(page_title="Asistente Genético (EDA + Chat)", page_icon="🧬", layout="wide")
@@ -40,12 +46,18 @@ st.title("🧬 Asistente Genético: EDA + Chat LLM (ligero)")
 st.caption("Sube un CSV (hasta ~1.000 filas) → EDA enriquecido → Baseline ML → Chat en español. "
            "Herramienta educativa; **no** es consejo médico.")
 
-# ===================== Catálogo de modelos LLM (ligeros) =====================
-MODEL_CATALOG = {
+# ===================== Catálogo de modelos =====================
+HF_MODEL_CATALOG = {
     "TinyLlama 1.1B Chat (por defecto)": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     "Llama 3.2 1B Instruct": "meta-llama/Llama-3.2-1B-Instruct",
     "Qwen2.5 0.5B Instruct": "Qwen/Qwen2.5-0.5B-Instruct",
     "Falcon 1B Instruct": "tiiuae/falcon-1b-instruct",
+}
+GROQ_MODEL_CATALOG = {
+    "Llama 3.1 8B (rápido)": "llama-3.1-8b-instant",
+    "Llama 3.1 70B (calidad)": "llama-3.1-70b-versatile",
+    "Llama 3 (8B) 8192 ctx": "llama3-8b-8192",
+    "Mixtral 8x7B 32k": "mixtral-8x7b-32768",
 }
 
 # ===================== Utilidades de datos =====================
@@ -149,19 +161,14 @@ def eda_summary_markdown(eda: Dict) -> str:
 # ===================== Backend local: carga cacheada =====================
 @st.cache_resource(show_spinner=True)
 def load_local_model(model_id: str, hf_token: str):
-    """
-    Descarga y cachea tokenizer y modelo para uso local (CPU).
-    Requiere transformers/tokenizers/torch.
-    """
     if not TRANSFORMERS_OK:
         raise RuntimeError("transformers/torch no están instalados. Agrega a requirements.txt.")
-
     tok = AutoTokenizer.from_pretrained(
         model_id, token=hf_token, use_fast=True, trust_remote_code=True
     )
     mdl = AutoModelForCausalLM.from_pretrained(
         model_id, token=hf_token,
-        torch_dtype=torch.float32,   # CPU; si tienes GPU, ajusta dtype y device_map
+        torch_dtype=torch.float32,   # CPU; si tienes GPU, ajusta dtype/device_map
         low_cpu_mem_usage=True,
         trust_remote_code=True
     )
@@ -186,24 +193,22 @@ def local_generate(tokenizer, model, prompt: str, max_new_tokens: int, temperatu
 
 # ===================== LLM: badge de estado =====================
 def llm_status_badge(llm: "TinyLLM") -> str:
-    which = "Local (transformers)" if llm.backend == "local" else "API (HF Inference)"
+    back = {"api": "API (HF Inference)", "groq": "Groq API (streaming)", "local": "Local (transformers)"}[llm.backend]
     if llm.available():
-        return (f"🟢 **LLM conectado** — {which} — modelo: `{llm.model}` · "
+        return (f"🟢 **LLM conectado** — {back} — modelo: `{llm.model}` · "
                 f"temp={st.session_state.get('llm_temp',0.2)} · "
-                f"max_tokens={st.session_state.get('llm_max_tokens',350)}")
-    return f"🟠 **LLM parcialmente configurado** — {which}. Revisa token/permisos si usas API."
+                f"máx_tokens={st.session_state.get('llm_max_tokens',350)}")
+    return f"🟠 **LLM parcialmente configurado** — {back}. Revisa claves/permisos."
 
-# =============== Cliente LLM con DOS backends (API y Local) ===============
+# =============== Cliente LLM con TRES backends (HF API, Groq, Local) ===============
 class TinyLLM:
     """
-    LLM con dos backends:
-      - API (HF Inference): usa requests + HF_TOKEN
-      - Local (transformers/tokenizers): descarga y ejecuta el modelo aquí (CPU)
-    Lee modelo de st.session_state['hf_model_override'] y backend de st.session_state['llm_backend'].
-    Maneja errores HTTP en claro. Respeta temperatura y max tokens desde la UI.
+    Backends:
+      - 'api'  (HF Inference): requests + HF_TOKEN
+      - 'groq' (Groq API): SDK + GROQ_API_KEY (soporta streaming)
+      - 'local' (transformers/tokenizers): modelo en CPU
     """
     def __init__(self, timeout: int = 60):
-        # modelo activo (selector del sidebar o secreto/env)
         def _get_secret(key, default=None):
             val = os.environ.get(key)
             if not val:
@@ -213,60 +218,83 @@ class TinyLLM:
                     val = default
             return val
 
-        self.model = st.session_state.get("hf_model_override") or _get_secret(
+        self.backend = st.session_state.get("llm_backend", "api")  # "api" | "groq" | "local"
+        self.model = st.session_state.get("llm_model_id") or _get_secret(
             "HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
         )
         self.hf_token = _get_secret("HF_TOKEN", None)
+        self.groq_key = _get_secret("GROQ_API_KEY", None)
         self.timeout = timeout
-        self.backend = st.session_state.get("llm_backend", "api")  # "api" | "local"
 
     def available(self) -> bool:
         if self.backend == "api":
-            # Con API pública algunos modelos responden sin token, pero lo normal es necesitarlo
             return bool(self.hf_token)
-        else:  # local
-            return TRANSFORMERS_OK  # requiere libs instaladas
+        if self.backend == "groq":
+            return GROQ_OK and bool(self.groq_key)
+        return TRANSFORMERS_OK  # local
 
     def _human_error(self, status: int, body_text: str) -> str:
         msg = (body_text or "")[:400]
         if status == 401:
-            return "⚠️ 401 No autorizado: revisa `HF_TOKEN`."
+            return "⚠️ 401 No autorizado: revisa token/credenciales."
         if status == 403:
             return (
-                "⚠️ 403 Prohibido: el modelo es privado o requiere aceptar sus términos.\n"
+                "⚠️ 403 Prohibido: el recurso es privado o requiere aceptar términos.\n"
                 "Soluciones:\n"
-                "1) Usa un `HF_TOKEN` con acceso.\n"
-                "2) En la página del modelo, pulsa 'Request access'/'Agree and access repository'.\n"
-                "3) Selecciona un modelo público en el sidebar y reintenta.\n"
+                "1) Usa una clave con acceso.\n"
+                "2) En la página del modelo/servicio, solicita o acepta acceso.\n"
+                "3) Prueba un modelo público desde el selector.\n"
                 f"Detalle: {msg}"
             )
         if status == 404:
-            return "⚠️ 404 No encontrado: revisa `HF_MODEL`/selector."
+            return "⚠️ 404 No encontrado: revisa el nombre del modelo."
         if status == 429:
             return "⚠️ 429 Rate limit: intenta de nuevo en breve."
         if status == 503:
-            return "⚠️ 503 Inicializando el modelo en HF; reintenta."
+            return "⚠️ 503 Servicio inicializándose o no disponible temporalmente."
         return f"⚠️ Error HTTP {status}: {msg}"
 
+    # --------- Modo no-stream (todos los backends) ---------
     def ask(self, system_prompt: str, user_prompt: str) -> str:
         temp = float(st.session_state.get("llm_temp", 0.2))
         max_tokens = int(st.session_state.get("llm_max_tokens", 350))
-        prompt = f"Sistema: {system_prompt}\n\nUsuario: {user_prompt}\n\nAsistente:"
 
-        # Backend LOCAL
+        # Groq (no-stream)
+        if self.backend == "groq":
+            if not GROQ_OK:
+                return "⚠️ Groq SDK no instalado. Agrega `groq` a requirements.txt."
+            if not self.groq_key:
+                return "⚠️ Groq API: configura `GROQ_API_KEY` en Secrets."
+            try:
+                client = Groq(api_key=self.groq_key)
+                rsp = client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=temp,
+                    # En Groq la doc usa max_completion_tokens
+                    max_completion_tokens=max_tokens,
+                )
+                return (rsp.choices[0].message.content or "").strip()
+            except Exception as e:
+                return f"⚠️ Error Groq API: {e}"
+
+        # Local
         if self.backend == "local":
             if not TRANSFORMERS_OK:
                 return "⚠️ Backend local no disponible: instala transformers/tokenizers/torch."
             try:
+                prompt = f"Sistema: {system_prompt}\n\nUsuario: {user_prompt}\n\nAsistente:"
                 tok, mdl = load_local_model(self.model, self.hf_token)
                 out = local_generate(tok, mdl, prompt, max_new_tokens=max_tokens, temperature=temp)
                 return out.strip()
             except Exception as e:
-                return f"⚠️ Error en backend local (transformers/tokenizers): {e}"
+                return f"⚠️ Error en backend local: {e}"
 
-        # Backend API (HF Inference)
+        # HF API
         if not self.hf_token:
-            # Modo offline si no hay token para API
             lines = [ln for ln in system_prompt.splitlines()
                      if any(tok in ln.lower() for tok in user_prompt.lower().split()[:5])]
             if not lines:
@@ -274,6 +302,7 @@ class TinyLLM:
             return "Modo sin token para API. Activa 'Local' o configura HF_TOKEN. Contexto EDA:\n\n" + "\n".join(lines[:40])
 
         headers = {"Authorization": f"Bearer {self.hf_token}", "Accept": "application/json"}
+        prompt = f"Sistema: {system_prompt}\n\nUsuario: {user_prompt}\n\nAsistente:"
         payload = {
             "inputs": prompt,
             "parameters": {"max_new_tokens": max_tokens, "temperature": temp},
@@ -285,7 +314,6 @@ class TinyLLM:
             r = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
         except requests.exceptions.RequestException as e:
             return f"⚠️ Error de red al llamar a HF Inference: {e}"
-
         if r.status_code != 200:
             try:
                 err = r.json().get("error", r.text)
@@ -297,13 +325,46 @@ class TinyLLM:
             data = r.json()
         except ValueError:
             return "⚠️ La respuesta de HF no es JSON válido."
-
         if isinstance(data, list) and data and "generated_text" in data[0]:
             text = data[0]["generated_text"]
             return text.split("Asistente:", 1)[-1].strip()
         if isinstance(data, dict) and "error" in data:
             return self._human_error(500, data["error"])
         return str(data)[:1000]
+
+    # --------- Streaming SOLO para Groq ---------
+    def ask_stream(self, system_prompt: str, user_prompt: str):
+        """Generador que rinde textos incrementales (para Streamlit) usando Groq stream=True."""
+        temp = float(st.session_state.get("llm_temp", 0.2))
+        max_tokens = int(st.session_state.get("llm_max_tokens", 350))
+        if self.backend != "groq":
+            # Fallback: yield la respuesta normal de ask()
+            yield self.ask(system_prompt, user_prompt)
+            return
+        if not GROQ_OK:
+            yield "⚠️ Groq SDK no instalado. Agrega `groq` a requirements.txt."
+            return
+        if not self.groq_key:
+            yield "⚠️ Groq API: configura `GROQ_API_KEY` en Secrets."
+            return
+        try:
+            client = Groq(api_key=self.groq_key)
+            stream = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temp,
+                max_completion_tokens=max_tokens,   # ver docs
+                stream=True,                        # ← clave para streaming
+            )
+            for chunk in stream:
+                delta = getattr(chunk.choices[0].delta, "content", None)
+                if delta:
+                    yield delta
+        except Exception as e:
+            yield f"⚠️ Error Groq API (stream): {e}"
 
 # ===================== Sidebar (carga, apariencia, LLM) =====================
 with st.sidebar:
@@ -315,26 +376,27 @@ with st.sidebar:
     tema_oscuro = st.toggle("Modo oscuro (gráficas)", value=False)
     PLOTLY_TEMPLATE = "plotly_dark" if tema_oscuro else "plotly"
 
-    st.header("3) LLM (español, pequeño)")
+    st.header("3) LLM (backend y modelo)")
     backend = st.radio(
         "Backend de LLM",
-        ["API (HF Inference)", "Local (transformers/tokenizers)"],
+        ["API (HF Inference)", "Groq API (stream)", "Local (transformers/tokenizers)"],
         index=0,
-        help="API = peticiones HTTP a Hugging Face; Local = descarga y ejecuta el modelo aquí."
+        help="HF = HTTP con HF_TOKEN · Groq = SDK con GROQ_API_KEY (stream) · Local = modelo en este servidor."
     )
-    st.session_state["llm_backend"] = "local" if backend.startswith("Local") else "api"
+    st.session_state["llm_backend"] = "groq" if "Groq" in backend else ("local" if backend.startswith("Local") else "api")
 
-    modelo_key = st.selectbox(
-        "Modelo:",
-        options=list(MODEL_CATALOG.keys()),
-        index=0,
-        help="Elige un modelo liviano."
-    )
-    modelo_id = MODEL_CATALOG[modelo_key]
-    custom_id = st.text_input("Modelo personalizado (opcional)", value="")
+    if st.session_state["llm_backend"] == "groq":
+        modelo_key = st.selectbox("Modelo (Groq):", options=list(GROQ_MODEL_CATALOG.keys()), index=0)
+        modelo_id = GROQ_MODEL_CATALOG[modelo_key]
+        custom_id = st.text_input("Modelo personalizado Groq (opcional)", value="")
+    else:
+        modelo_key = st.selectbox("Modelo (HF/Local):", options=list(HF_MODEL_CATALOG.keys()), index=0)
+        modelo_id = HF_MODEL_CATALOG[modelo_key]
+        custom_id = st.text_input("Modelo personalizado HF (opcional)", value="")
     if custom_id.strip():
         modelo_id = custom_id.strip()
-    st.session_state["hf_model_override"] = modelo_id
+
+    st.session_state["llm_model_id"] = modelo_id
     st.caption(f"Usando: `{modelo_id}`")
 
     st.markdown("**Parámetros del modelo**")
@@ -361,7 +423,7 @@ st.dataframe(df.head(), use_container_width=True)
 eda = basic_eda(df)
 
 # ===================== Pestañas =====================
-tab_eda, tab_ml, tab_chat, tab_export = st.tabs(["📊 EDA", "🤦 ML", "💬 Chat", "📥 Exportar"])
+tab_eda, tab_ml, tab_chat, tab_export = st.tabs(["📊 EDA", "🤖 ML", "💬 Chat", "📥 Exportar"])
 
 # ------------------------------- EDA TAB -------------------------------
 with tab_eda:
@@ -496,17 +558,18 @@ with tab_ml:
 with tab_chat:
     st.subheader("Chat en español")
 
-    # Estado del LLM y diagnóstico
     llm = TinyLLM()
     st.info(llm_status_badge(llm))
 
     cols = st.columns([1, 1, 2])
     with cols[0]:
         if st.button("Probar conexión LLM"):
+            # Para Groq, hace una llamada normal (no-stream) cortita
             test_resp = llm.ask("Eres un sistema de prueba.", "Di 'ok' en una palabra.")
-            st.write("**Respuesta de prueba:**", test_resp[:500])
+            st.write("**Respuesta de prueba:**", (test_resp or "")[:500])
     with cols[1]:
-        st.write(f"**Backend:** {'Local (transformers)' if llm.backend=='local' else 'API (HF Inference)'}")
+        back = {"api": "HF Inference", "groq": "Groq API (stream)", "local": "Local/transformers"}[llm.backend]
+        st.write(f"**Backend:** {back}")
         st.write(f"**Modelo:** `{llm.model}`")
 
     # Historial de chat
@@ -530,24 +593,37 @@ with tab_chat:
         st.session_state.mensajes.append({"role":"user", "content":pregunta})
         with st.chat_message("user"):
             st.markdown(pregunta)
-        respuesta = llm.ask(sistema, pregunta)
 
-        # Sugerencia rápida si 403
-        if isinstance(respuesta, str) and respuesta.startswith("⚠️ 403"):
-            st.warning("El modelo actual no está accesible con tu token.")
-            cA, cB = st.columns(2)
-            with cA:
-                if st.button("Cambiar a modelo público (TinyLlama)"):
-                    st.session_state["hf_model_override"] = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-                    st.experimental_rerun()
-            with cB:
-                if st.button("Cambiar a Qwen 0.5B"):
-                    st.session_state["hf_model_override"] = "Qwen/Qwen2.5-0.5B-Instruct"
-                    st.experimental_rerun()
+        # Streaming si backend = Groq; si no, respuesta normal
+        if llm.backend == "groq":
+            full = ""
+            with st.chat_message("assistant"):
+                placeholder = st.empty()
+                for delta in llm.ask_stream(sistema, pregunta):
+                    full += delta
+                    placeholder.markdown(full)
+            st.session_state.mensajes.append({"role":"assistant", "content":full})
+        else:
+            respuesta = llm.ask(sistema, pregunta)
 
-        st.session_state.mensajes.append({"role":"assistant", "content":respuesta})
-        with st.chat_message("assistant"):
-            st.markdown(respuesta)
+            # Atajos si falla HF/Groq
+            if isinstance(respuesta, str) and ("Groq API" in respuesta or "HF_TOKEN" in respuesta or respuesta.startswith("⚠️ 403")):
+                st.warning("Revisa las credenciales/permisos o cambia a un modelo público.")
+                cA, cB = st.columns(2)
+                with cA:
+                    if st.button("Usar TinyLlama (HF)"):
+                        st.session_state["llm_backend"] = "api"
+                        st.session_state["llm_model_id"] = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+                        st.experimental_rerun()
+                with cB:
+                    if st.button("Usar Llama 3.1 8B (Groq)"):
+                        st.session_state["llm_backend"] = "groq"
+                        st.session_state["llm_model_id"] = "llama-3.1-8b-instant"
+                        st.experimental_rerun()
+
+            st.session_state.mensajes.append({"role":"assistant", "content":respuesta})
+            with st.chat_message("assistant"):
+                st.markdown(respuesta)
 
 # ------------------------------- EXPORT TAB -------------------------------
 with tab_export:
@@ -559,7 +635,6 @@ with tab_export:
     st.download_button("⬇️ Descargar resumen_eda.md", data=md.encode("utf-8"),
                        file_name="resumen_eda.md", mime="text/markdown")
 
-    # Exportables en CSV
     st.write("**Tablas clave:**")
     if 'miss_tbl' not in locals():
         miss_tbl = pd.DataFrame({

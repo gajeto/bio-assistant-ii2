@@ -8,3 +8,4 @@ transformers>=4.42.0
 tokenizers>=0.15.2
 torch>=2.2.0          # CPU está bien; si usas GPU, instala el wheel apropiado
 accelerate>=0.30.0    # opcional pero recomendado
+groq>=0.11.0
