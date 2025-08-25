@@ -14,13 +14,13 @@ from ml_utils import (
     safe_train_test_split
 )
 from llm_groq import GroqLLM, build_system_prompt, GROQ_MODEL_CATALOG
-from ui_theme import apply_bio_theme
+from ui_theme import apply_bio_theme, render_kpi_cards   # ← import KPI cards
 from demo_tab import render_demo_tab
 
 from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.pipeline import Pipeline
 
-# Gráficas (Plotly)
+# Plotly (gráficas)
 try:
     from plotly import express as px
     PLOTLY_OK = True
@@ -28,9 +28,9 @@ except Exception as e:
     PLOTLY_OK = False
     PX_ERR = e
 
-# ===================== Configuración y tema =====================
+# ===================== Config & Tema =====================
 st.set_page_config(page_title="Asistente Genético (EDA+ML+Groq)", page_icon="🧬", layout="wide")
-apply_bio_theme()  # CSS: tema verde + fondos + clases scroll
+apply_bio_theme()
 
 st.title("🧬 Asistente Genético: EDA + ML + Chat (Groq)")
 st.caption("Sube un CSV (≤ ~1.000 filas) → EDA → Baseline ML → Chat en español con Groq. "
@@ -64,11 +64,11 @@ if up is not None:
     df = load_csv(up)
 elif usar_demo:
     df = demo_data(1000)
-    df = cap_rows(df, 1000)
 else:
     st.info("Sube un CSV o activa el demo en la barra lateral.")
     st.stop()
 
+df = cap_rows(df, 1000)
 st.success(f"Datos cargados: {df.shape[0]} filas × {df.shape[1]} columnas")
 st.dataframe(df.head(), use_container_width=True)
 
@@ -76,9 +76,63 @@ st.dataframe(df.head(), use_container_width=True)
 eda = basic_eda(df)
 
 # ===================== Tabs =====================
-tab_eda, tab_ml, tab_chat, tab_demo, tab_export = st.tabs(
-    ["📊 EDA", "🤖 ML", "💬 Chat", "🔬 Demo EDA→ML→LLM", "📥 Exportar"]
+tab_chat, tab_eda, tab_ml, tab_demo, tab_export = st.tabs(
+    ["💬 Asistente", "📊 EDA", "🤖 ML", "🔬 Integración LLM", "📥 Exportar"]
 )
+
+# ------------------------------- CHAT TAB (con scroll) -------------------------------
+with tab_chat:
+    st.subheader("Chat en español (Groq)")
+    model_id = st.session_state.get("llm_model_id") or "llama-3.1-8b-instant"
+    api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
+    temp = float(st.session_state.get("llm_temp", 0.2))
+    max_tokens = int(st.session_state.get("llm_max_tokens", 350))
+    llm = GroqLLM(model_id=model_id, api_key=api_key, temp=temp, max_tokens=max_tokens)
+
+    st.info(llm.status_badge())
+
+    if "mensajes" not in st.session_state:
+        st.session_state.mensajes = [{"role":"assistant",
+                                      "content":"Hola 👋 Puedo responder en español sobre tu dataset, el EDA y el baseline ML. ¿Qué quieres saber?"}]
+    # Render histórico simple
+    for m in st.session_state.mensajes:
+        with st.chat_message(m["role"]):
+            # Para mensajes largos antiguos, también usamos scroll
+            html = f'<div class="scrollbox">{m["content"].replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\\n","<br/>")}</div>'
+            st.markdown(html, unsafe_allow_html=True)
+
+    # Contexto: EDA + (si existe) resumen ML
+    eda_resumen = eda_summary_text(eda, df)
+    ml_text = ""
+    if "ml" in st.session_state:
+        ml = st.session_state["ml"]
+        ml_ins = ml_key_insights(ml, st.session_state["ml"]["X_te"])
+        ml_text = "INSIGHTS DE ML:\n" + "\n".join(f"- {b}" for b in ml_ins) + "\n"
+    sistema = build_system_prompt(eda_resumen, ml_text)
+
+    pregunta = st.chat_input("Escribe tu pregunta…")
+    if pregunta:
+        st.session_state.mensajes.append({"role":"user", "content":pregunta})
+        with st.chat_message("user"):
+            st.markdown(f'<div class="scrollbox">{pregunta}</div>', unsafe_allow_html=True)
+
+        # Streaming con scroll
+        full = ""
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+
+            def render_scrolling_md(text: str):
+                safe = (text.replace("&","&amp;")
+                            .replace("<","&lt;")
+                            .replace(">","&gt;")
+                            .replace("\n","<br/>"))
+                placeholder.markdown(f'<div class="scrollbox">{safe}</div>', unsafe_allow_html=True)
+
+            for delta in llm.ask_stream(sistema, pregunta):
+                full += delta or ""
+                render_scrolling_md(full)
+
+        st.session_state.mensajes.append({"role":"assistant", "content":full})
 
 # ------------------------------- EDA TAB -------------------------------
 with tab_eda:
@@ -152,7 +206,7 @@ with tab_ml:
     tarea = infer_task(y)
     st.write(f"Tarea detectada: **{tarea}**")
 
-    # Controles para el split
+    # Config de split
     st.markdown("**Configuración de partición train/test**")
     csplit = st.columns(3)
     with csplit[0]:
@@ -163,17 +217,15 @@ with tab_ml:
         max_ts = st.slider("Máximo test_size permitido", 0.20, 0.50, max(0.35, test_size), 0.05,
                            help="Se usa solo si está activado 'Forzar estratificación'.")
 
-    # Distribución global de la etiqueta (si clasificación)
+    # Distribución global de la etiqueta
     if tarea == "clasificación":
         st.markdown("**Distribución de la etiqueta (global):**")
         vc_abs = y.astype(str).value_counts()
         vc_pct = (y.astype(str).value_counts(normalize=True) * 100).round(1)
-        st.dataframe(
-            pd.DataFrame({"conteo": vc_abs, "porcentaje_%": vc_pct}),
-            use_container_width=True, height=240
-        )
+        st.dataframe(pd.DataFrame({"conteo": vc_abs, "porcentaje_%": vc_pct}),
+                     use_container_width=True, height=220)
 
-    # Preparar preprocesamiento + modelo
+    # Pipeline
     pre = make_preprocessor(X)
     modelo = LogisticRegression(max_iter=600) if tarea == "clasificación" else LinearRegression()
     pipe = Pipeline([("prep", pre), ("model", modelo)])
@@ -182,14 +234,13 @@ with tab_ml:
         # Split robusto
         X_tr, X_te, y_tr, y_te, split_info = safe_train_test_split(
             X, y, tarea=tarea,
-            test_size=float(test_size),
-            random_state=42,
+            test_size=float(test_size), random_state=42,
             min_per_class=2,
             auto_increase_test_size=bool(force_strat),
             max_test_size=float(max_ts),
         )
 
-        # Feedback del split
+        # Métricas del split
         colm = st.columns(3)
         with colm[0]:
             st.metric("Clases", split_info.get("n_classes") or (y.nunique() if tarea=="clasificación" else "-"))
@@ -200,38 +251,37 @@ with tab_ml:
         if split_info.get("rare_classes"):
             st.warning("Clases raras (<2 ejemplos): " + ", ".join(split_info["rare_classes"]))
         if not split_info["stratified"] and tarea == "clasificación":
-            st.warning(split_info.get("reason") or
-                       "Estratificación desactivada: clases muy raras o test_size insuficiente.")
+            st.warning(split_info.get("reason") or "Estratificación desactivada.")
 
-        # Distribución por clase en train/test (si clasificación)
-        if tarea == "clasificación":
-            ct1, ct2 = st.columns(2)
-            with ct1:
-                st.write("**Train – distribución por clase**")
-                vc_tr = y_tr.astype(str).value_counts()
-                vc_tr_pct = (y_tr.astype(str).value_counts(normalize=True)*100).round(1)
-                st.dataframe(pd.DataFrame({"conteo": vc_tr, "porcentaje_%": vc_tr_pct}),
-                             use_container_width=True, height=220)
-            with ct2:
-                st.write("**Test – distribución por clase**")
-                vc_te = y_te.astype(str).value_counts()
-                vc_te_pct = (y_te.astype(str).value_counts(normalize=True)*100).round(1)
-                st.dataframe(pd.DataFrame({"conteo": vc_te, "porcentaje_%": vc_te_pct}),
-                             use_container_width=True, height=220)
-
-        # Entrenar y mostrar resultados
+        # Entrenar & guardar
         ml_art = ml_metrics_and_artifacts(pipe, X_tr, X_te, y_tr, y_te, tarea)
         st.session_state["ml"] = {"pipeline": pipe, "X_te": X_te, "y_te": y_te, **ml_art}
 
-    # Mostrar resultados si existen
+        # ===== KPI GRANDES =====
+        ml = st.session_state["ml"]
+        if tarea == "clasificación":
+            items = [
+                ("Accuracy (test)", f"{ml['acc_te']:.3f}", f"Train: {ml['acc_tr']:.3f}"),
+                ("F1-macro (test)", f"{ml['f1_te']:.3f}", f"Train: {ml['f1_tr']:.3f}"),
+                ("Clases", f"{len(ml['labels'])}", "en test"),
+            ]
+            render_kpi_cards(items, caption="Resultados del entrenamiento")
+        else:
+            items = [
+                ("RMSE (test)", f"{ml['rmse']:.3f}", f"Baseline media: {ml['rmse_baseline']:.3f}"),
+                ("MAE (test)", f"{ml['mae']:.3f}", ""),
+                ("R² (test)", f"{ml['r2']:.3f}", ""),
+            ]
+            render_kpi_cards(items, caption="Resultados del entrenamiento")
+
+    # Visualizaciones + importancias
     if "ml" in st.session_state and st.session_state["ml"]["tarea"] == tarea:
         ml = st.session_state["ml"]
         if tarea == "clasificación":
             st.write(f"**Accuracy (test):** {ml['acc_te']:.3f} | **F1-macro (test):** {ml['f1_te']:.3f} "
                      f"(train: acc={ml['acc_tr']:.3f}, f1={ml['f1_tr']:.3f})")
             if PLOTLY_OK:
-                etiquetas = ml["labels"]
-                cm = ml["cm"]
+                etiquetas = ml["labels"]; cm = ml["cm"]
                 fig_cm = px.imshow(cm, x=etiquetas, y=etiquetas, text_auto=True, color_continuous_scale="Greens",
                                    title="Matriz de confusión", template=PLOTLY_TEMPLATE)
                 fig_cm.update_layout(xaxis_title="Predicha", yaxis_title="Real")
@@ -246,7 +296,6 @@ with tab_ml:
                 st.plotly_chart(px.histogram(resid, nbins=40, title="Histograma de residuales",
                                              template=PLOTLY_TEMPLATE), use_container_width=True)
 
-        # Importancias (perm)
         imp = ml["perm_importance"]
         st.write("**Importancias por permutación (top):**")
         st.dataframe(imp, use_container_width=True, height=240)
@@ -254,53 +303,10 @@ with tab_ml:
             st.plotly_chart(px.bar(imp, x="feature", y="importance", error_y="std",
                                    title="Importancia (perm)", template=PLOTLY_TEMPLATE),
                             use_container_width=True)
-
         st.info(ml_objective_interpretation(ml))
 
-# ------------------------------- CHAT TAB (Groq con streaming) -------------------------------
-with tab_chat:
-    st.subheader("Chat en español (Groq)")
-    model_id = st.session_state.get("llm_model_id") or "llama-3.1-8b-instant"
-    api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
-    temp = float(st.session_state.get("llm_temp", 0.2))
-    max_tokens = int(st.session_state.get("llm_max_tokens", 350))
-    llm = GroqLLM(model_id=model_id, api_key=api_key, temp=temp, max_tokens=max_tokens)
 
-    st.info(llm.status_badge())
-
-    if "mensajes" not in st.session_state:
-        st.session_state.mensajes = [{"role":"assistant",
-                                      "content":"Hola 👋 Puedo responder en español sobre tu dataset, el EDA y el baseline ML. ¿Qué quieres saber?"}]
-    for m in st.session_state.mensajes:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
-
-    # Contexto: EDA + (si existe) resumen ML
-    eda_resumen = eda_summary_text(eda, df)
-    ml_text = ""
-    if "ml" in st.session_state:
-        ml = st.session_state["ml"]
-        ml_ins = ml_key_insights(ml, st.session_state["ml"]["X_te"])
-        ml_text = "INSIGHTS DE ML:\n" + "\n".join(f"- {b}" for b in ml_ins) + "\n"
-
-    sistema = build_system_prompt(eda_resumen, ml_text)
-
-    pregunta = st.chat_input("Escribe tu pregunta…")
-    if pregunta:
-        st.session_state.mensajes.append({"role":"user", "content":pregunta})
-        with st.chat_message("user"):
-            st.markdown(pregunta)
-
-        # Streaming Groq
-        full = ""
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            for delta in llm.ask_stream(sistema, pregunta):
-                full += delta
-                placeholder.markdown(full)
-        st.session_state.mensajes.append({"role":"assistant", "content":full})
-
-# ------------------------------- DEMO TAB (EDA→ML→LLM con scroll) -------------------------------
+# ------------------------------- DEMO TAB -------------------------------
 with tab_demo:
     render_demo_tab(df=df, eda=eda, PLOTLY_TEMPLATE=PLOTLY_TEMPLATE)
 
