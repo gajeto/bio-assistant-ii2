@@ -46,9 +46,9 @@ def render_demo_tab(df: pd.DataFrame, eda: dict, PLOTLY_TEMPLATE: str):
     )
 
     sistema_sin = (
-        "Eres un asistente de datos genéticos. Responde en español, breve y conservador. "
-        "Si te falta contexto, dilo explícitamente. Al final, agrega una sección **Recursos adicionales (curados)** "
-        "con 2–4 enlaces solo de dominios: ncbi.nlm.nih.gov, ensembl.org, gnomad.broadinstitute.org, ebi.ac.uk, "
+        "Eres un asistente de datos biológicos generales y con capacidad de responder temas genéticos específicos. Responde en español, breve y conservador. "
+        "Si te falta contexto, dilo explícitamente. Al final, agrega una sección Recursos adicionales (curados) "
+        "con 2 a 4 enlaces solo de dominios como: ncbi.nlm.nih.gov, ensembl.org, gnomad.broadinstitute.org, ebi.ac.uk, "
         "who.int, cdc.gov, nature.com, wikipedia.org, clinvar. Si no aplica, omite la sección."
     )
 

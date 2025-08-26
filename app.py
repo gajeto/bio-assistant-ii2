@@ -32,8 +32,8 @@ except Exception as e:
 st.set_page_config(page_title="Asistente Genético (EDA+ML+Groq)", page_icon="🧬", layout="wide")
 apply_bio_theme()
 
-st.title("🧬 Asistente Genético: EDA + ML + Chat (Groq)")
-st.caption("Sube un CSV (≤ ~1.000 filas) → EDA → Baseline ML → Chat en español con Groq. "
+st.title("🧬 Asistente Genético")
+st.caption("Sube un CSV  → EDA → Baseline ML → Chat en español con Groq. "
            "Herramienta educativa; **no** es consejo médico.")
 
 # ===================== Sidebar =====================
@@ -64,11 +64,11 @@ if up is not None:
     df = load_csv(up)
 elif usar_demo:
     df = demo_data(1000)
+    df = cap_rows(df, 1000)
 else:
     st.info("Sube un CSV o activa el demo en la barra lateral.")
     st.stop()
 
-df = cap_rows(df, 1000)
 st.success(f"Datos cargados: {df.shape[0]} filas × {df.shape[1]} columnas")
 st.dataframe(df.head(), use_container_width=True)
 

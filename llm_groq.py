@@ -34,8 +34,8 @@ def build_system_prompt(eda_summary: str, ml_block: str = "") -> str:
         "Responde en **español**, breve y conservador. Puedes dar ejemplos de análogias si aplica. "
         "No des consejo médico. Usa el contexto provisto para cifras.\n\n"
         f"RESUMEN EDA:\n{eda_summary}\n\n{ml_block}\n"
-        "Al final, agrega una sección **Recursos adicionales (curados)** con 2–4 enlaces "
-        "solo de estos dominios: " + ", ".join(ALLOWED_LINK_DOMAINS) + ". "
+        "Al final, agrega una sección Recursos adicionales (curados) con 2 a 4 enlaces "
+        "de dominios web relacionados con biología o genética "
         "Si no hay un recurso pertinente, omite la sección."
     )
 
