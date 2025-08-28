@@ -302,7 +302,7 @@ with tab_ml:
         )
 
         # Interacción (en TRAIN/TEST para evitar fugas)
-        from eda_plus import find_top_corr_pair
+        from eda import find_top_corr_pair
         if add_interaction:
             pair = find_top_corr_pair(X_tr)
             if pair:
