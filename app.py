@@ -91,7 +91,7 @@ tab_chat, tab_eda, tab_ml, tab_demo, tab_export = st.tabs(
 
 # ------------------------------- CHAT TAB (con scroll) -------------------------------
 with tab_chat:
-    st.subheader("Chat assistant (Groq)")
+    st.subheader("Asistente Chat (Groq)")
     model_id = st.session_state.get("llm_model_id") or "llama-3.1-8b-instant"
     api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
     temp = float(st.session_state.get("llm_temp", 0.2))
@@ -102,7 +102,7 @@ with tab_chat:
 
     if "mensajes" not in st.session_state:
         st.session_state.mensajes = [{"role":"assistant",
-                                      "content":"Hola 👋 Puedo responder en español sobre tu dataset, el EDA, un ML baseline o temas generales de biología. ¿Qué quieres saber?"}]
+                                      "content":"Hola 👋 Puedo responder en español sobre temas generales de biología o si prefieres particularidades de tu dataset, el EDA o un baseline de ML. ¿Qué quieres saber?"}]
     # Render histórico simple
     for m in st.session_state.mensajes:
         with st.chat_message(m["role"]):
@@ -171,13 +171,13 @@ with tab_eda:
         st.write("**Tipos y cardinalidades**")
         st.dataframe(dtype_tbl, use_container_width=True, height=260)
 
-    st.write("**Descriptivos numéricos**")
+    st.write("**Análisis descriptivo**")
     num_desc = eda["desc_num"]
     if not num_desc.empty:
         st.dataframe(num_desc, use_container_width=True, height=260)
 
     # ==== NUEVO: Outliers & Sesgo ====
-    st.subheader("Calidad avanzada: Outliers y Sesgo")
+    st.subheader("Identificación de outliers y sesgo")
     rep_out, any_out_mask = outlier_report(df)
     st.dataframe(rep_out, use_container_width=True, height=260)
     if PLOTLY_OK and not rep_out.empty:
@@ -202,7 +202,7 @@ with tab_eda:
 
     # Heatmap de faltantes (muestra 200 filas para legibilidad)
     if PLOTLY_OK:
-        st.subheader("Patrones de faltantes (muestra)")
+        st.subheader("Patrones de datos faltantes (muestra)")
         sample = df.sample(min(200, len(df)), random_state=42)
         heat = sample.isna().astype(int)
         st.plotly_chart(px.imshow(heat.T, aspect="auto", color_continuous_scale="Greens",
@@ -210,7 +210,7 @@ with tab_eda:
                         use_container_width=True)
     
         # ==== Descriptivos numéricos con formato visible ====
-    st.subheader("Descriptivos numéricos (formato destacado)")
+    st.subheader("Descriptivas numéricas")
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
     if num_cols:
         desc = df[num_cols].describe().T
@@ -261,7 +261,7 @@ with tab_eda:
     miss_pct = df.isna().mean().sort_values(ascending=False)
     top_miss = miss_pct.head(3)[miss_pct.head(3) > 0]
     if len(top_miss) > 0:
-        res_bullets.append("- Columnas con más faltantes: " + ", ".join([f"**{c}** ({p*100:.1f}%)" for c,p in top_miss.items()]) + ".")
+        res_bullets.append("- Columnas con más datos faltantes: " + ", ".join([f"**{c}** ({p*100:.1f}%)" for c,p in top_miss.items()]) + ".")
     # Outliers
     try:
         rep_out, _mask = outlier_report(df)
@@ -294,7 +294,7 @@ with tab_eda:
 
 # ------------------------------- ML TAB -------------------------------
 with tab_ml:
-    st.subheader("Baseline ML enriquecido")
+    st.subheader("Machine Learning Baseline")
 
     # ======= Selección de target y tarea =======
     posibles_targets = [c for c in df.columns if c.lower() in ("etiqueta","label","target")]
@@ -304,7 +304,7 @@ with tab_ml:
     y_all = df[target]
     X_all = df.drop(columns=[target])
     tarea = infer_task(y_all)
-    st.write(f"Tarea detectada: **{tarea}**")
+    st.write(f"Tipo de problema de ML: **{tarea}**")
 
     # ======= Config de split =======
     st.markdown("**Configuración de partición train/test**")
@@ -312,7 +312,7 @@ with tab_ml:
     with csplit[0]:
         test_size = st.slider("Proporción de test", 0.10, 0.50, 0.20, 0.05)
     with csplit[1]:
-        force_strat = st.checkbox("Forzar estratificación auto-ajustando test_size", value=True)
+        force_strat = st.checkbox("Forzar estratificación ajustando test_size", value=True)
     with csplit[2]:
         max_ts = st.slider("Máximo test_size permitido", 0.20, 0.50, max(0.35, test_size), 0.05)
 
@@ -324,14 +324,14 @@ with tab_ml:
     modelo = build_model(tarea, modelo_name)
 
     # ======= Preprocesamiento =======
-    st.markdown("**Preprocesamiento y FE**")
+    st.markdown("**Preprocesamiento y Feature Engineering**")
     cprep = st.columns(3)
     with cprep[0]:
         use_advanced = st.checkbox("Preprocesamiento avanzado (robusto)", value=True)
     with cprep[1]:
         yeoj = st.checkbox("Yeo-Johnson", value=True)
     with cprep[2]:
-        minfreq = st.slider("OneHot min_frequency", 0.0, 0.10, 0.01, 0.01)
+        minfreq = st.slider("Codificación OneHot frecuencia", 0.0, 0.10, 0.01, 0.01)
 
     add_interaction = st.checkbox("Interacción (producto) del par numérico más correlacionado", value=True)
 
