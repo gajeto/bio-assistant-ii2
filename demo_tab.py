@@ -8,6 +8,8 @@ import streamlit as st
 from llm_groq import GroqLLM, build_system_prompt
 from ml_utils import ml_key_insights
 from utils_data import eda_summary_text
+from ui_theme import render_kpi_cards  # ← usamos tarjetas KPI para cuantificación
+
 try:
     from plotly import express as px
     PLOTLY_OK = True
@@ -36,16 +38,12 @@ def _scrollbox(md_text: str, height: int = 360):
 
 
 def _estimate_tokens(s: str) -> int:
-    """
-    Estimación sencilla de tokens (aprox.): 1 token ≈ 4 caracteres.
-    Esto NO es exacto; sirve para dar porcentajes orientativos.
-    """
+    # Estimación sencilla de tokens (aprox.): 1 token ≈ 4 caracteres
     return max(1, math.ceil(len(s) / 4))
 
 
 def _context_breakdown(context_text: str, answer_text: str) -> tuple[float, float, dict]:
     """
-    Devuelve (pct_context, pct_modelo, detalle).
     pct_context ≈ context_tokens / (context_tokens + answer_tokens)
     pct_modelo  ≈ answer_tokens / (context_tokens + answer_tokens)
     """
@@ -58,7 +56,7 @@ def _context_breakdown(context_text: str, answer_text: str) -> tuple[float, floa
 
 
 def _eda_support_charts(df: pd.DataFrame, PLOTLY_TEMPLATE: str):
-    """Pequeño set de gráficas EDA para respaldar respuestas."""
+    """Gráficas EDA para respaldar respuestas."""
     num_cols = df.select_dtypes(include="number").columns.tolist()
     miss = df.isna().mean().mul(100).sort_values(ascending=False)
     miss_tbl = miss[miss > 0].reset_index()
@@ -113,21 +111,21 @@ def _ml_support_charts(ml: dict, PLOTLY_TEMPLATE: str):
 def render_demo_tab(df: pd.DataFrame, eda: dict, PLOTLY_TEMPLATE: str = "plotly"):
     """
     Demo comparativa:
-      - 3 columnas: Sin contexto | Con EDA | EDA + ML
-      - Chat en cada columna (no streaming) para evitar scroll con texto incompleto
-      - Cuantificación (aprox.) del peso del contexto vs. modelo
-      - Gráficas de soporte EDA/ML si aplica
+      - 3 columnas: Sin contexto | Con EDA | EDA + ML (al mismo tiempo, sin streaming)
+      - Chat en cada columna; inyección de EDA/ML como contexto según corresponda
+      - Tarjetas KPI para cuantificar (aprox.) contexto vs. modelo
+      - Gráficas/artefactos EDA & ML para respaldar respuestas
     """
     st.subheader("Comparador: Sin contexto vs. EDA vs. EDA + ML")
 
-    # ===== Preparar LLM =====
+    # ===== LLM =====
     model_id = st.session_state.get("llm_model_id") or "llama-3.1-8b-instant"
     api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
     temp = float(st.session_state.get("llm_temp", 0.2))
     max_tokens = int(st.session_state.get("llm_max_tokens", 350))
     llm = GroqLLM(model_id=model_id, api_key=api_key, temp=temp, max_tokens=max_tokens)
 
-    # ===== Mensaje del usuario para la comparación =====
+    # ===== Pregunta del usuario (misma para los 3) =====
     pregunta = st.text_input(
         "Escribe una pregunta para comparar cómo responde el LLM en los tres escenarios",
         value="¿Qué problemas de calidad de datos ves y qué pasos recomiendas antes de entrenar un modelo?"
@@ -136,7 +134,7 @@ def render_demo_tab(df: pd.DataFrame, eda: dict, PLOTLY_TEMPLATE: str = "plotly"
     with col_btn:
         ejecutar = st.button("Comparar respuestas")
 
-    # ===== Preparar contextos =====
+    # ===== Contextos =====
     eda_text = eda_summary_text(eda, df) if eda else ""
     ml_text = ""
     if "ml" in st.session_state:
@@ -147,7 +145,7 @@ def render_demo_tab(df: pd.DataFrame, eda: dict, PLOTLY_TEMPLATE: str = "plotly"
         except Exception:
             ml_text = ""
 
-    # ===== Tres columnas lado a lado =====
+    # ===== Tres columnas simultáneas =====
     c_sin, c_eda, c_full = st.columns(3)
 
     # ----------------- SIN CONTEXTO -----------------
@@ -155,15 +153,19 @@ def render_demo_tab(df: pd.DataFrame, eda: dict, PLOTLY_TEMPLATE: str = "plotly"
         st.markdown("### 🟢 Sin contexto")
         if ejecutar and pregunta.strip():
             sistema_sin = build_system_prompt("", "")
-            respuesta = llm.ask(sistema_sin, pregunta)  # NO streaming → evita scroll parcial
+            respuesta = llm.ask(sistema_sin, pregunta)
             _scrollbox(respuesta, height=360)
 
-            # Cuantificación aproximada
+            # Tarjetas KPI de cuantificación
             pct_ctx, pct_model, det = _context_breakdown("", respuesta)
-            st.caption(f"**Uso de contexto (aprox.):** {pct_ctx}% contexto / {pct_model}% modelo "
-                       f"(tokens ~ ctx:{det['context_tokens_est']}, resp:{det['answer_tokens_est']})")
+            items = [
+                ("Contexto usado", f"{pct_ctx}%", f"≈ ctx: {det['context_tokens_est']} tok"),
+                ("Modelo base", f"{pct_model}%", f"≈ resp: {det['answer_tokens_est']} tok"),
+                ("Total", f"{det['total_est']}", "tokens est."),
+            ]
+            render_kpi_cards(items, caption="Cuantificación aproximada")
 
-        with st.expander("Ver soporte EDA/ML (si aplica)"):
+        with st.expander("Soporte EDA/ML (si aplica)"):
             st.info("Este panel no incluye contexto EDA/ML.")
 
     # ----------------- CON EDA -----------------
@@ -174,10 +176,13 @@ def render_demo_tab(df: pd.DataFrame, eda: dict, PLOTLY_TEMPLATE: str = "plotly"
             respuesta = llm.ask(sistema_eda, pregunta)
             _scrollbox(respuesta, height=360)
 
-            # Cuantificación aproximada
             pct_ctx, pct_model, det = _context_breakdown(eda_text, respuesta)
-            st.caption(f"**Uso de contexto (aprox.):** {pct_ctx}% contexto / {pct_model}% modelo "
-                       f"(tokens ~ ctx:{det['context_tokens_est']}, resp:{det['answer_tokens_est']})")
+            items = [
+                ("Contexto usado", f"{pct_ctx}%", f"≈ ctx: {det['context_tokens_est']} tok"),
+                ("Modelo base", f"{pct_model}%", f"≈ resp: {det['answer_tokens_est']} tok"),
+                ("Total", f"{det['total_est']}", "tokens est."),
+            ]
+            render_kpi_cards(items, caption="Cuantificación aproximada")
 
         with st.expander("Gráficas EDA usadas como soporte"):
             _eda_support_charts(df, PLOTLY_TEMPLATE)
@@ -190,16 +195,19 @@ def render_demo_tab(df: pd.DataFrame, eda: dict, PLOTLY_TEMPLATE: str = "plotly"
             respuesta = llm.ask(sistema_full, pregunta)
             _scrollbox(respuesta, height=360)
 
-            # Cuantificación aproximada
             pct_ctx, pct_model, det = _context_breakdown(eda_text + "\n" + ml_text, respuesta)
-            st.caption(f"**Uso de contexto (aprox.):** {pct_ctx}% contexto / {pct_model}% modelo "
-                       f"(tokens ~ ctx:{det['context_tokens_est']}, resp:{det['answer_tokens_est']})")
+            items = [
+                ("Contexto usado", f"{pct_ctx}%", f"≈ ctx: {det['context_tokens_est']} tok"),
+                ("Modelo base", f"{pct_model}%", f"≈ resp: {det['answer_tokens_est']} tok"),
+                ("Total", f"{det['total_est']}", "tokens est."),
+            ]
+            render_kpi_cards(items, caption="Cuantificación aproximada")
 
         with st.expander("Gráficas/artefactos del baseline ML"):
             _ml_support_charts(st.session_state.get("ml", {}), PLOTLY_TEMPLATE)
 
-    # Nota de transparencia metodológica
+    # Nota metodológica
     st.caption(
-        "ℹ️ Los porcentajes de “uso de contexto” son estimaciones basadas en longitud de texto; "
-        "no equivalen a métricas de atención internas del modelo ni a contadores reales de tokens."
+        "ℹ️ Los porcentajes de “uso de contexto” son estimaciones por longitud de texto; "
+        "no equivalen a métricas internas de atención ni a contadores reales de tokens."
     )
