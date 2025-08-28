@@ -9,10 +9,11 @@ from utils_data import (
     basic_eda, eda_summary_text, eda_summary_markdown
 )
 from ml_utils import (
-    infer_task, make_preprocessor,
+    infer_task, make_preprocessor, make_preprocessor_advanced,
     ml_metrics_and_artifacts, ml_key_insights, ml_objective_interpretation,
     safe_train_test_split
 )
+from eda import outlier_report, skew_kurtosis_table, suggest_transforms, find_top_corr_pair
 from llm_groq import GroqLLM, build_system_prompt, GROQ_MODEL_CATALOG
 from ui_theme import apply_bio_theme, render_kpi_cards   # ← import KPI cards
 from demo_tab import render_demo_tab
@@ -33,8 +34,7 @@ st.set_page_config(page_title="Asistente BIOGEN", page_icon="🧬", layout="wide
 apply_bio_theme()
 
 st.title("🧬 Asistente BIOGEN Insights")
-st.caption("Carga un dataset de contenido relacionado a temas biológicos (o genéticos) e interactua en lenguaje natural para explorar sus posibilidades"
-           "Herramienta educativa; **no** es consejo médico.")
+st.caption("Carga un dataset de contenido relacionado a temas biológicos (o genéticos) e interactua en lenguaje natural para explorar sus posibilidades")
 
 # ===================== Sidebar =====================
 with st.sidebar:
@@ -153,10 +153,8 @@ with tab_eda:
         st.write("**Faltantes por columna**")
         st.dataframe(miss_tbl, use_container_width=True, height=260)
         if PLOTLY_OK:
-            st.plotly_chart(
-                px.bar(miss_tbl, x="columna", y="faltantes_%", title="% faltantes", template=PLOTLY_TEMPLATE),
-                use_container_width=True
-            )
+            st.plotly_chart(px.bar(miss_tbl, x="columna", y="faltantes_%", title="% faltantes", template=PLOTLY_TEMPLATE),
+                            use_container_width=True)
         else:
             st.warning(f"Plotly no disponible: {PX_ERR}")
 
@@ -164,86 +162,122 @@ with tab_eda:
         st.write("**Tipos y cardinalidades**")
         st.dataframe(dtype_tbl, use_container_width=True, height=260)
 
-    st.write("**Análisis descriptivo**")
+    st.write("**Descriptivos numéricos**")
     num_desc = eda["desc_num"]
     if not num_desc.empty:
         st.dataframe(num_desc, use_container_width=True, height=260)
-    else:
-        st.write("No hay columnas numéricas.")
 
-    num_cols = df.select_dtypes(include=np.number).columns.tolist()
-    cat_cols = df.select_dtypes(exclude=np.number).columns.tolist()
+    # ==== NUEVO: Outliers & Sesgo ====
+    st.subheader("Calidad avanzada: Outliers y Sesgo")
+    rep_out, any_out_mask = outlier_report(df)
+    st.dataframe(rep_out, use_container_width=True, height=260)
+    if PLOTLY_OK and not rep_out.empty:
+        st.plotly_chart(px.bar(rep_out.head(12), x="columna", y="pct_outliers",
+                               title="% de outliers (IQR) – Top 12", template=PLOTLY_TEMPLATE),
+                        use_container_width=True)
+    sk_tbl = skew_kurtosis_table(df)
+    st.write("**Skew / Kurtosis (ordenado por sesgo):**")
+    st.dataframe(sk_tbl, use_container_width=True, height=220)
 
-    with st.expander("Distribuciones numéricas (Top 5)"):
-        if PLOTLY_OK:
-            for c in num_cols[:6]:
-                st.plotly_chart(px.histogram(df, x=c, nbins=40, title=c, marginal="box",
-                                             template=PLOTLY_TEMPLATE), use_container_width=True)
+    # Boxplots de las 3 columnas con más outliers
+    if PLOTLY_OK and not rep_out.empty:
+        st.write("**Boxplots (Top 3 columnas con más outliers)**")
+        for c in rep_out["columna"].head(3):
+            st.plotly_chart(px.box(df, y=c, points="suspectedoutliers", title=f"Boxplot: {c}",
+                                   template=PLOTLY_TEMPLATE), use_container_width=True)
 
-    with st.expander("Frecuencias categóricas (Top 5)"):
-        if PLOTLY_OK:
-            for c in cat_cols[:6]:
-                vc = df[c].astype(str).value_counts(dropna=False).head(20).reset_index()
-                vc.columns = [c, "conteo"]
-                st.plotly_chart(px.bar(vc, x=c, y="conteo", title=c, template=PLOTLY_TEMPLATE),
-                                use_container_width=True)
+    # Sugerencias de FE/Prepro
+    st.subheader("Sugerencias de Feature Engineering / Preprocesamiento")
+    for s in suggest_transforms(df):
+        st.markdown(f"- {s}")
 
-    if len(num_cols) >= 2 and PLOTLY_OK:
-        st.subheader("Matriz de correlación (variables numéricas)")
-        corr = df[num_cols[:12]].corr(numeric_only=True)
-        st.plotly_chart(px.imshow(corr, text_auto=False, aspect="auto", title="Correlaciones",
-                                  template=PLOTLY_TEMPLATE), use_container_width=True)
+    # Heatmap de faltantes (muestra 200 filas para legibilidad)
+    if PLOTLY_OK:
+        st.subheader("Patrones de faltantes (muestra)")
+        sample = df.sample(min(200, len(df)), random_state=42)
+        heat = sample.isna().astype(int)
+        st.plotly_chart(px.imshow(heat.T, aspect="auto", color_continuous_scale="Greens",
+                                  title="Heatmap de faltantes (1=NaN)", template=PLOTLY_TEMPLATE),
+                        use_container_width=True)
 
 # ------------------------------- ML TAB -------------------------------
 with tab_ml:
-    st.subheader("Baseline ML")
+    st.subheader("Baseline ML mínimo")
     posibles_targets = [c for c in df.columns if c.lower() in ("etiqueta","label","target")]
     target_sugerido = posibles_targets[0] if posibles_targets else df.columns[0]
     target = st.selectbox("Variable objetivo", options=df.columns,
                           index=(list(df.columns).index(target_sugerido) if target_sugerido in df.columns else 0))
-    y = df[target]
-    X = df.drop(columns=[target])
-    tarea = infer_task(y)
-    st.write(f"Tarea de Machine Learning detectada: **{tarea}**")
+    y_all = df[target]
+    X_all = df.drop(columns=[target])
+    tarea = infer_task(y_all)
+    st.write(f"Tarea detectada: **{tarea}**")
 
     # Config de split
-    st.markdown("**Configuración de particiones train/test**")
+    st.markdown("**Configuración de partición train/test**")
     csplit = st.columns(3)
     with csplit[0]:
         test_size = st.slider("Proporción de test", 0.10, 0.50, 0.20, 0.05)
     with csplit[1]:
-        force_strat = st.checkbox("Forzar estratificación auto ajustando test_size", value=True)
+        force_strat = st.checkbox("Forzar estratificación auto-ajustando test_size", value=True)
     with csplit[2]:
         max_ts = st.slider("Máximo test_size permitido", 0.20, 0.50, max(0.35, test_size), 0.05,
                            help="Se usa solo si está activado 'Forzar estratificación'.")
 
+    # Config de preprocesamiento/FE
+    st.markdown("**Preprocesamiento y FE para el baseline**")
+    cprep = st.columns(3)
+    with cprep[0]:
+        use_advanced = st.checkbox("Preprocesamiento avanzado (robusto)", value=True,
+                                   help="Mediana/RobustScaler + Yeo-Johnson + OneHot min_frequency")
+    with cprep[1]:
+        yeoj = st.checkbox("Yeo-Johnson (estabiliza varianza)", value=True)
+    with cprep[2]:
+        minfreq = st.slider("OneHot min_frequency", 0.0, 0.10, 0.01, 0.01,
+                            help="Agrupa categorías raras; 0 desactiva (usa OneHot estándar).")
+
+    add_interaction = st.checkbox("Añadir interacción simple (producto) del par numérico más correlacionado", value=True)
+
     # Distribución global de la etiqueta
     if tarea == "clasificación":
-        st.markdown("**Distribución de la variable de respuesta:**")
-        vc_abs = y.astype(str).value_counts()
-        vc_pct = (y.astype(str).value_counts(normalize=True) * 100).round(1)
+        st.markdown("**Distribución de la etiqueta (global):**")
+        vc_abs = y_all.astype(str).value_counts()
+        vc_pct = (y_all.astype(str).value_counts(normalize=True) * 100).round(1)
         st.dataframe(pd.DataFrame({"conteo": vc_abs, "porcentaje_%": vc_pct}),
                      use_container_width=True, height=220)
 
-    # Pipeline
-    pre = make_preprocessor(X)
+    # Modelo
     modelo = LogisticRegression(max_iter=600) if tarea == "clasificación" else LinearRegression()
-    pipe = Pipeline([("prep", pre), ("model", modelo)])
 
-    if st.button("Entrenar modelo baseline"):
+    if st.button("Entrenar baseline"):
         # Split robusto
         X_tr, X_te, y_tr, y_te, split_info = safe_train_test_split(
-            X, y, tarea=tarea,
+            X_all, y_all, tarea=tarea,
             test_size=float(test_size), random_state=42,
-            min_per_class=2,
-            auto_increase_test_size=bool(force_strat),
-            max_test_size=float(max_ts),
+            min_per_class=2, auto_increase_test_size=bool(force_strat), max_test_size=float(max_ts),
         )
+        # Interacción (basada en TRAIN para evitar fugas graves)
+        if add_interaction:
+            pair = find_top_corr_pair(X_tr)
+            if pair:
+                a, b = pair
+                X_tr = X_tr.copy(); X_te = X_te.copy()
+                X_tr[f"{a}_x_{b}"] = pd.to_numeric(X_tr[a], errors="coerce") * pd.to_numeric(X_tr[b], errors="coerce")
+                X_te[f"{a}_x_{b}"] = pd.to_numeric(X_te[a], errors="coerce") * pd.to_numeric(X_te[b], errors="coerce")
+                st.info(f"Se añadió interacción: **{a} × {b}**")
+
+        # Preprocesador
+        if use_advanced:
+            pre = make_preprocessor_advanced(X_tr, robust=True, yeo_johnson=bool(yeoj),
+                                             onehot_min_freq=(float(minfreq) if minfreq>0 else None))
+        else:
+            pre = make_preprocessor(X_tr)
+
+        pipe = Pipeline([("prep", pre), ("model", modelo)])
 
         # Métricas del split
         colm = st.columns(3)
         with colm[0]:
-            st.metric("Clases", split_info.get("n_classes") or (y.nunique() if tarea=="clasificación" else "-"))
+            st.metric("Clases", split_info.get("n_classes") or (y_all.nunique() if tarea=="clasificación" else "-"))
         with colm[1]:
             st.metric("test_size usado", f"{split_info['used_test_size']:.2f}")
         with colm[2]:
@@ -257,7 +291,7 @@ with tab_ml:
         ml_art = ml_metrics_and_artifacts(pipe, X_tr, X_te, y_tr, y_te, tarea)
         st.session_state["ml"] = {"pipeline": pipe, "X_te": X_te, "y_te": y_te, **ml_art}
 
-        # ===== KPI GRANDES =====
+        # KPI GRANDES
         ml = st.session_state["ml"]
         if tarea == "clasificación":
             items = [
@@ -265,14 +299,13 @@ with tab_ml:
                 ("F1-macro (test)", f"{ml['f1_te']:.3f}", f"Train: {ml['f1_tr']:.3f}"),
                 ("Clases", f"{len(ml['labels'])}", "en test"),
             ]
-            render_kpi_cards(items, caption="Resultados del entrenamiento")
         else:
             items = [
                 ("RMSE (test)", f"{ml['rmse']:.3f}", f"Baseline media: {ml['rmse_baseline']:.3f}"),
                 ("MAE (test)", f"{ml['mae']:.3f}", ""),
                 ("R² (test)", f"{ml['r2']:.3f}", ""),
             ]
-            render_kpi_cards(items, caption="Resultados del entrenamiento")
+        render_kpi_cards(items, caption="Resultados del entrenamiento")
 
     # Visualizaciones + importancias
     if "ml" in st.session_state and st.session_state["ml"]["tarea"] == tarea:

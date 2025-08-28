@@ -8,13 +8,13 @@ from llm_groq import GroqLLM, build_system_prompt
 from ui_theme import scrollable_md
 
 def render_demo_tab(df: pd.DataFrame, eda: dict, PLOTLY_TEMPLATE: str):
-    st.subheader("Demostración: ¿el LLM usa los insights del **EDA** y del **ML**?")
+    st.subheader("Enriqueciendo el modelo LLM con insights del EDA y del baseline ML")
 
     # 1) Insights EDA
     posibles_targets = [c for c in df.columns if c.lower() in ("etiqueta","label","target")]
     target_sugerido = posibles_targets[0] if posibles_targets else None
     target_for_insights = st.selectbox(
-        "Columna de etiqueta (opcional, para enriquecer insights EDA):",
+        "Selecciona la variable del EDA en la que te gustaría profundizar:",
         options=["(ninguna)"] + list(df.columns),
         index=(list(df.columns).index(target_sugerido)+1 if target_sugerido in df.columns else 0)
     )
