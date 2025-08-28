@@ -125,4 +125,81 @@ def render_demo_tab(df: pd.DataFrame, eda: dict, PLOTLY_TEMPLATE: str = "plotly"
     api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
     temp = float(st.session_state.get("llm_temp", 0.2))
     max_tokens = int(st.session_state.get("llm_max_tokens", 350))
-    llm = GroqLLM(model_id=model_
+    llm = GroqLLM(model_id=model_id, api_key=api_key, temp=temp, max_tokens=max_tokens)
+
+    # ===== Mensaje del usuario para la comparación =====
+    pregunta = st.text_input(
+        "Escribe una pregunta para comparar cómo responde el LLM en los tres escenarios",
+        value="¿Qué problemas de calidad de datos ves y qué pasos recomiendas antes de entrenar un modelo?"
+    )
+    col_btn, _ = st.columns([1, 3])
+    with col_btn:
+        ejecutar = st.button("Comparar respuestas")
+
+    # ===== Preparar contextos =====
+    eda_text = eda_summary_text(eda, df) if eda else ""
+    ml_text = ""
+    if "ml" in st.session_state:
+        ml = st.session_state["ml"]
+        try:
+            ml_ins = ml_key_insights(ml, st.session_state["ml"]["X_te"])
+            ml_text = "INSIGHTS DE ML:\n" + "\n".join(f"- {b}" for b in ml_ins) + "\n"
+        except Exception:
+            ml_text = ""
+
+    # ===== Tres columnas lado a lado =====
+    c_sin, c_eda, c_full = st.columns(3)
+
+    # ----------------- SIN CONTEXTO -----------------
+    with c_sin:
+        st.markdown("### 🟢 Sin contexto")
+        if ejecutar and pregunta.strip():
+            sistema_sin = build_system_prompt("", "")
+            respuesta = llm.ask(sistema_sin, pregunta)  # NO streaming → evita scroll parcial
+            _scrollbox(respuesta, height=360)
+
+            # Cuantificación aproximada
+            pct_ctx, pct_model, det = _context_breakdown("", respuesta)
+            st.caption(f"**Uso de contexto (aprox.):** {pct_ctx}% contexto / {pct_model}% modelo "
+                       f"(tokens ~ ctx:{det['context_tokens_est']}, resp:{det['answer_tokens_est']})")
+
+        with st.expander("Ver soporte EDA/ML (si aplica)"):
+            st.info("Este panel no incluye contexto EDA/ML.")
+
+    # ----------------- CON EDA -----------------
+    with c_eda:
+        st.markdown("### 🟢 Con EDA")
+        if ejecutar and pregunta.strip():
+            sistema_eda = build_system_prompt(eda_text, "")
+            respuesta = llm.ask(sistema_eda, pregunta)
+            _scrollbox(respuesta, height=360)
+
+            # Cuantificación aproximada
+            pct_ctx, pct_model, det = _context_breakdown(eda_text, respuesta)
+            st.caption(f"**Uso de contexto (aprox.):** {pct_ctx}% contexto / {pct_model}% modelo "
+                       f"(tokens ~ ctx:{det['context_tokens_est']}, resp:{det['answer_tokens_est']})")
+
+        with st.expander("Gráficas EDA usadas como soporte"):
+            _eda_support_charts(df, PLOTLY_TEMPLATE)
+
+    # ----------------- EDA + ML -----------------
+    with c_full:
+        st.markdown("### 🟢 EDA + ML")
+        if ejecutar and pregunta.strip():
+            sistema_full = build_system_prompt(eda_text, ml_text)
+            respuesta = llm.ask(sistema_full, pregunta)
+            _scrollbox(respuesta, height=360)
+
+            # Cuantificación aproximada
+            pct_ctx, pct_model, det = _context_breakdown(eda_text + "\n" + ml_text, respuesta)
+            st.caption(f"**Uso de contexto (aprox.):** {pct_ctx}% contexto / {pct_model}% modelo "
+                       f"(tokens ~ ctx:{det['context_tokens_est']}, resp:{det['answer_tokens_est']})")
+
+        with st.expander("Gráficas/artefactos del baseline ML"):
+            _ml_support_charts(st.session_state.get("ml", {}), PLOTLY_TEMPLATE)
+
+    # Nota de transparencia metodológica
+    st.caption(
+        "ℹ️ Los porcentajes de “uso de contexto” son estimaciones basadas en longitud de texto; "
+        "no equivalen a métricas de atención internas del modelo ni a contadores reales de tokens."
+    )
