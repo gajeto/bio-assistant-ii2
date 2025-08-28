@@ -113,53 +113,106 @@ def dbscan_outliers(df: pd.DataFrame, eps: float = 0.7, min_samples: int = 10):
     out_mask = (lab == -1)
     return lab, out_mask
 
-# -------------------- Multicolinealidad (VIF + Nº condición) --------------------
+def _numeric_cols(df: pd.DataFrame):
+    return list(df.select_dtypes(include=np.number).columns)
+
 def compute_vif_table(df: pd.DataFrame) -> pd.DataFrame:
     """
-    VIF por columna numérica usando regresión lineal con sklearn.
-    VIF = 1 / (1 - R^2) regrediendo cada variable contra el resto.
+    VIF robusto:
+      - Descarta columnas numéricas completamente NaN.
+      - Imputa/estandariza.
+      - Elimina columnas casi constantes (var ≈ 0) para evitar singularidades.
+      - Alinea SIEMPRE los nombres de features con la matriz transformada.
+      - Para columnas descartadas por var≈0, reporta VIF=∞ (indicativo).
     """
-    nums = numeric_cols(df)
+    nums = _numeric_cols(df)
+    # descarta columnas totalmente NaN
+    nums = [c for c in nums if df[c].notna().sum() > 0]
     if len(nums) < 2:
         return pd.DataFrame(columns=["feature", "vif", "r2_aux"])
+
     X = df[nums].copy()
-    # imputación y estandarización
+
+    # Imputación y estandarización → ndarray
     imp = SimpleImputer(strategy="median")
     sc = StandardScaler()
     X_imp = imp.fit_transform(X)
+    X_imp = np.asarray(X_imp)
+
+    # Alinear nombres por seguridad si, por algún motivo, cambia la forma
+    n_features_imp = X_imp.shape[1] if X_imp.ndim == 2 else 1
+    nums = nums[:n_features_imp]
+    if n_features_imp < 2:
+        return pd.DataFrame(columns=["feature", "vif", "r2_aux"])
+
     X_std = sc.fit_transform(X_imp)
-    res = []
-    for i, name in enumerate(nums):
-        y = X_std[:, i]
-        Xr = np.delete(X_std, i, axis=1)
+    X_std = np.asarray(X_std)
+    n_features = X_std.shape[1] if X_std.ndim == 2 else 1
+    nums = nums[:n_features]
+    if n_features < 2:
+        return pd.DataFrame(columns=["feature", "vif", "r2_aux"])
+
+    # Detectar columnas ~constantes
+    var = X_std.var(axis=0)
+    keep_mask = var > 1e-12
+    kept_idx = np.where(keep_mask)[0]
+    dropped_idx = np.where(~keep_mask)[0]
+
+    X_use = X_std[:, kept_idx] if kept_idx.size > 0 else np.empty((X_std.shape[0], 0))
+    features_kept = [nums[i] for i in kept_idx]
+    features_dropped = [nums[i] for i in dropped_idx]
+
+    results = []
+    # VIF de las columnas retenidas
+    for j, fname in enumerate(features_kept):
+        y = X_use[:, j]
+        Xr = np.delete(X_use, j, axis=1)
         if Xr.shape[1] == 0:
-            vif = 1.0; r2 = 0.0
+            vif, r2 = 1.0, 0.0
         else:
             try:
                 lr = LinearRegression()
                 lr.fit(Xr, y)
                 r2 = float(lr.score(Xr, y))
-                r2 = min(max(r2, 0.0), 0.999999999)  # clamp para evitar división por 0
+                r2 = min(max(r2, 0.0), 0.999999999)  # clamp
                 vif = float(1.0 / (1.0 - r2))
             except Exception:
-                r2 = np.nan; vif = np.inf
-        res.append({"feature": name, "vif": vif, "r2_aux": r2})
-    vif_df = pd.DataFrame(res).sort_values("vif", ascending=False)
+                r2, vif = np.nan, np.inf
+        results.append({"feature": fname, "vif": vif, "r2_aux": r2})
+
+    # Columnas descartadas por var≈0 → VIF=∞ (indicativo)
+    for fname in features_dropped:
+        results.append({"feature": fname, "vif": float("inf"), "r2_aux": np.nan})
+
+    vif_df = pd.DataFrame(results).sort_values("vif", ascending=False).reset_index(drop=True)
     return vif_df
+
 
 def condition_number(df: pd.DataFrame) -> float | None:
     """
-    Número de condición de la matriz estandarizada (mayor → más multicolinealidad).
+    Número de condición robusto:
+      - Imputa/estandariza numéricas.
+      - Elimina columnas ~constantes antes de calcular cond().
     """
-    nums = numeric_cols(df)
+    nums = _numeric_cols(df)
+    nums = [c for c in nums if df[c].notna().sum() > 0]
     if len(nums) < 2:
         return None
+
     X = df[nums].copy()
     imp = SimpleImputer(strategy="median")
     sc = StandardScaler()
     X_std = sc.fit_transform(imp.fit_transform(X))
+    X_std = np.asarray(X_std)
+
+    # drop ~constantes
+    var = X_std.var(axis=0)
+    mask = var > 1e-12
+    X_use = X_std[:, mask] if mask.any() else np.empty((X_std.shape[0], 0))
+    if X_use.shape[1] < 2:
+        return None
+
     try:
-        cn = float(np.linalg.cond(X_std))
+        return float(np.linalg.cond(X_use))
     except Exception:
-        cn = None
-    return cn
+        return None

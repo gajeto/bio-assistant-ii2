@@ -227,13 +227,19 @@ with tab_eda:
 
     # ==== Multicolinealidad: VIF y número de condición ====
     st.subheader("Multicolinealidad (VIF y número de condición)")
-    vif_df = compute_vif_table(df)
+    try:
+        vif_df = compute_vif_table(df)
+    except Exception as e:
+        vif_df = pd.DataFrame(columns=["feature", "vif", "r2_aux"])
+        st.warning("No se pudo calcular VIF de forma robusta en este dataset.")
+
     if not vif_df.empty:
         st.dataframe(vif_df.round({"vif": 2, "r2_aux": 3}), use_container_width=True, height=260)
         max_vif = np.nanmax(vif_df["vif"].values)
         st.caption(f"VIF alto (>10) sugiere multicolinealidad fuerte. VIF máximo observado: **{max_vif:.2f}**.")
     else:
-        st.info("No fue posible calcular VIF (se requieren ≥2 columnas numéricas).")
+        st.info("No fue posible calcular VIF (se requieren ≥2 columnas numéricas no constantes).")
+
 
     cn = condition_number(df)
     if cn is not None:
