@@ -7,7 +7,7 @@ MAIN_BG = "https://images.unsplash.com/photo-1559757175-08ea0eac0e3f?q=80&w=1600
 SIDE_BG = "https://images.unsplash.com/photo-1583912268180-6ec9a24b8301?q=80&w=1200&auto=format&fit=crop"
 
 # Ilustración representativa para la sidebar (ADN)
-SIDEBAR_ILLUSTRATION = "https://images.unsplash.com/photo-1535930749574-1399327ce78f?q=80&w=800&auto=format&fit=crop"
+SIDEBAR_ILLUSTRATION = "https://r2.erweima.ai/i/CmS5w6EvRFC7ANS9Ls788g.png"
 
 
 def apply_bio_theme(show_sidebar_image: bool = True, sidebar_caption: str = "Análisis de datos biológicos / genéticos"):
