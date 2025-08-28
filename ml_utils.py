@@ -122,59 +122,6 @@ def make_preprocessor_advanced(
     return ColumnTransformer([("num", Pipeline(num_steps), num_cols),
                               ("cat", cat_pipe, cat_cols)])
 
-# ml_utils.py (añadir en cualquier parte, p. ej. debajo de make_preprocessor_advanced)
-CLASSIFIERS = {
-    "Logistic Regression": lambda: LogisticRegression(max_iter=600),
-    "RandomForest (Clas.)": lambda: RandomForestClassifier(n_estimators=200, random_state=42),
-    "GradientBoosting (Clas.)": lambda: GradientBoostingClassifier(random_state=42),
-    "LinearSVC": lambda: LinearSVC(),
-    "KNN (Clas.)": lambda: KNeighborsClassifier(n_neighbors=5),
-    "Naive Bayes": lambda: GaussianNB(),
-}
-
-REGRESSORS = {
-    "Linear Regression": lambda: LinearRegression(),
-    "Ridge": lambda: Ridge(alpha=1.0),
-    "Lasso": lambda: Lasso(alpha=0.001),
-    "RandomForest (Regr.)": lambda: RandomForestRegressor(n_estimators=200, random_state=42),
-    "GradientBoosting (Regr.)": lambda: GradientBoostingRegressor(random_state=42),
-    "SVR (RBF)": lambda: SVR(C=1.0, epsilon=0.1),
-    "KNN (Regr.)": lambda: KNeighborsRegressor(n_neighbors=5),
-}
-
-def model_choices(tarea: str):
-    return list(CLASSIFIERS.keys()) if tarea == "clasificación" else list(REGRESSORS.keys())
-
-def build_model(tarea: str, name: str):
-    if tarea == "clasificación":
-        return CLASSIFIERS.get(name, CLASSIFIERS["Logistic Regression"])()
-    return REGRESSORS.get(name, REGRESSORS["Linear Regression"])()
-
-def ml_bullet_summary(ml: Dict) -> list[str]:
-    """
-    Resumen compacto en viñetas: rendimiento, variables influyentes, errores/clases/confianza.
-    """
-    bullets = []
-    if ml["tarea"] == "clasificación":
-        bullets.append(f"Rendimiento (test): Accuracy={ml['acc_te']:.3f}, F1-macro={ml['f1_te']:.3f} "
-                       f"(train acc={ml['acc_tr']:.3f}, f1={ml['f1_tr']:.3f}).")
-        if ml.get("top_errors"):
-            top = ", ".join([f"{r}→{p}:{n}" for r, p, n in ml["top_errors"][:3]])
-            bullets.append(f"Errores más frecuentes (real→pred): {top}.")
-        if hasattr(ml.get("perm_importance"), "empty") and not ml["perm_importance"].empty:
-            feats = ", ".join(ml["perm_importance"].head(5)["feature"].astype(str).tolist())
-            bullets.append(f"Variables más influyentes (perm.): {feats}.")
-    else:
-        bullets.append(f"Rendimiento (test): RMSE={ml['rmse']:.3f}, MAE={ml['mae']:.3f}, R²={ml['r2']:.3f} "
-                       f"(RMSE baseline={ml['rmse_baseline']:.3f}).")
-        bullets.append(f"Diagnóstico de residuales: media≈{ml['resid_mean']:.3f}, p95(|resid|)≈{ml['resid_p95']:.3f}.")
-        if hasattr(ml.get("perm_importance"), "empty") and not ml["perm_importance"].empty:
-            feats = ", ".join(ml["perm_importance"].head(5)["feature"].astype(str).tolist())
-            bullets.append(f"Variables más influyentes (perm.): {feats}.")
-    # Cierra con interpretación objetiva
-    bullets.append(ml_objective_interpretation(ml))
-    return bullets
-
 
 # -------- Métricas e insights --------
 def compute_perm_importance(pipeline: Pipeline, X_te: pd.DataFrame, y_te: pd.Series, tarea: str, topk: int = 8) -> pd.DataFrame:
@@ -245,3 +192,56 @@ def ml_objective_interpretation(ml: Dict) -> str:
     msg.append("Mejora vs baseline." if rmse < base else "No mejora al baseline; ajustar features/modelo.")
     if abs(ml["resid_mean"]) > 0.1*rmse: msg.append("Sesgo en residuales; revisar especificación.")
     return " ".join(msg)
+
+# ml_utils.py (añadir en cualquier parte, p. ej. debajo de make_preprocessor_advanced)
+CLASSIFIERS = {
+    "Logistic Regression": lambda: LogisticRegression(max_iter=600),
+    "RandomForest (Clas.)": lambda: RandomForestClassifier(n_estimators=200, random_state=42),
+    "GradientBoosting (Clas.)": lambda: GradientBoostingClassifier(random_state=42),
+    "LinearSVC": lambda: LinearSVC(),
+    "KNN (Clas.)": lambda: KNeighborsClassifier(n_neighbors=5),
+    "Naive Bayes": lambda: GaussianNB(),
+}
+
+REGRESSORS = {
+    "Linear Regression": lambda: LinearRegression(),
+    "Ridge": lambda: Ridge(alpha=1.0),
+    "Lasso": lambda: Lasso(alpha=0.001),
+    "RandomForest (Regr.)": lambda: RandomForestRegressor(n_estimators=200, random_state=42),
+    "GradientBoosting (Regr.)": lambda: GradientBoostingRegressor(random_state=42),
+    "SVR (RBF)": lambda: SVR(C=1.0, epsilon=0.1),
+    "KNN (Regr.)": lambda: KNeighborsRegressor(n_neighbors=5),
+}
+
+def model_choices(tarea: str):
+    return list(CLASSIFIERS.keys()) if tarea == "clasificación" else list(REGRESSORS.keys())
+
+def build_model(tarea: str, name: str):
+    if tarea == "clasificación":
+        return CLASSIFIERS.get(name, CLASSIFIERS["Logistic Regression"])()
+    return REGRESSORS.get(name, REGRESSORS["Linear Regression"])()
+
+def ml_bullet_summary(ml: Dict) -> list[str]:
+    """
+    Resumen compacto en viñetas: rendimiento, variables influyentes, errores/clases/confianza.
+    """
+    bullets = []
+    if ml["tarea"] == "clasificación":
+        bullets.append(f"Rendimiento (test): Accuracy={ml['acc_te']:.3f}, F1-macro={ml['f1_te']:.3f} "
+                       f"(train acc={ml['acc_tr']:.3f}, f1={ml['f1_tr']:.3f}).")
+        if ml.get("top_errors"):
+            top = ", ".join([f"{r}→{p}:{n}" for r, p, n in ml["top_errors"][:3]])
+            bullets.append(f"Errores más frecuentes (real→pred): {top}.")
+        if hasattr(ml.get("perm_importance"), "empty") and not ml["perm_importance"].empty:
+            feats = ", ".join(ml["perm_importance"].head(5)["feature"].astype(str).tolist())
+            bullets.append(f"Variables más influyentes (perm.): {feats}.")
+    else:
+        bullets.append(f"Rendimiento (test): RMSE={ml['rmse']:.3f}, MAE={ml['mae']:.3f}, R²={ml['r2']:.3f} "
+                       f"(RMSE baseline={ml['rmse_baseline']:.3f}).")
+        bullets.append(f"Diagnóstico de residuales: media≈{ml['resid_mean']:.3f}, p95(|resid|)≈{ml['resid_p95']:.3f}.")
+        if hasattr(ml.get("perm_importance"), "empty") and not ml["perm_importance"].empty:
+            feats = ", ".join(ml["perm_importance"].head(5)["feature"].astype(str).tolist())
+            bullets.append(f"Variables más influyentes (perm.): {feats}.")
+    # Cierra con interpretación objetiva
+    bullets.append(ml_objective_interpretation(ml))
+    return bullets
