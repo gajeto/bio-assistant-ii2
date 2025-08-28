@@ -15,7 +15,7 @@ from ml_utils import (
 )
 from eda import (
     outlier_report, skew_kurtosis_table, suggest_transforms, find_top_corr_pair,
-    pca_2d, dbscan_outliers
+    pca_2d, dbscan_outliers, compute_vif_table, condition_number
 )
 from llm_groq import GroqLLM, build_system_prompt, GROQ_MODEL_CATALOG
 from ui_theme import apply_bio_theme, render_kpi_cards   # ← import KPI cards
@@ -202,6 +202,83 @@ with tab_eda:
         st.plotly_chart(px.imshow(heat.T, aspect="auto", color_continuous_scale="Greens",
                                   title="Heatmap de faltantes (1=NaN)", template=PLOTLY_TEMPLATE),
                         use_container_width=True)
+    
+        # ==== Descriptivos numéricos con formato visible ====
+    st.subheader("Descriptivos numéricos (formato destacado)")
+    num_cols = df.select_dtypes(include=np.number).columns.tolist()
+    if num_cols:
+        desc = df[num_cols].describe().T
+        desc = desc.rename(columns={
+            "count": "conteo", "mean": "media", "std": "desv",
+            "min": "min", "25%": "p25", "50%": "mediana", "75%": "p75", "max": "max"
+        })
+        desc = desc[["conteo","media","desv","min","p25","mediana","p75","max"]].round(3)
+        st.dataframe(desc, use_container_width=True, height=300)
+    else:
+        st.info("No hay columnas numéricas.")
+
+    # ==== Matriz de correlaciones (si aplica) ====
+    if PLOTLY_OK and len(num_cols) >= 2:
+        st.subheader("Matriz de correlación (subset numérico)")
+        corr = df[num_cols[:12]].corr(numeric_only=True)
+        st.plotly_chart(px.imshow(corr, text_auto=False, aspect="auto",
+                                title="Correlaciones", template=PLOTLY_TEMPLATE),
+                        use_container_width=True)
+
+    # ==== Multicolinealidad: VIF y número de condición ====
+    st.subheader("Multicolinealidad (VIF y número de condición)")
+    vif_df = compute_vif_table(df)
+    if not vif_df.empty:
+        st.dataframe(vif_df.round({"vif": 2, "r2_aux": 3}), use_container_width=True, height=260)
+        max_vif = np.nanmax(vif_df["vif"].values)
+        st.caption(f"VIF alto (>10) sugiere multicolinealidad fuerte. VIF máximo observado: **{max_vif:.2f}**.")
+    else:
+        st.info("No fue posible calcular VIF (se requieren ≥2 columnas numéricas).")
+
+    cn = condition_number(df)
+    if cn is not None:
+        st.caption(f"Número de condición (matriz estandarizada): **{cn:.1f}** "
+                f"(>30 indica posible multicolinealidad problemática).")
+
+    # ==== Resumen final de insights (bullets) ====
+    st.subheader("Resumen de insights del EDA")
+    res_bullets = []
+    # Tamaño
+    res_bullets.append(f"- Filas: **{df.shape[0]}**, Columnas: **{df.shape[1]}**.")
+    # Faltantes
+    miss_pct = df.isna().mean().sort_values(ascending=False)
+    top_miss = miss_pct.head(3)[miss_pct.head(3) > 0]
+    if len(top_miss) > 0:
+        res_bullets.append("- Columnas con más faltantes: " + ", ".join([f"**{c}** ({p*100:.1f}%)" for c,p in top_miss.items()]) + ".")
+    # Outliers
+    try:
+        rep_out, _mask = outlier_report(df)
+        if not rep_out.empty and rep_out["pct_outliers"].max() > 0:
+            r = rep_out.head(3)[["columna","pct_outliers"]].values
+            res_bullets.append("- Outliers (IQR) más afectados: " + ", ".join([f"**{c}** ({pct:.1f}%)" for c,pct in r]) + ".")
+    except Exception:
+        pass
+    # Correlación fuerte
+    try:
+        if len(num_cols) >= 2:
+            cmat = df[num_cols].corr(numeric_only=True).abs()
+            np.fill_diagonal(cmat.values, np.nan)
+            max_corr = np.nanmax(cmat.values)
+            if np.isfinite(max_corr) and max_corr >= 0.8:
+                i, j = np.unravel_index(np.nanargmax(cmat.values), cmat.shape)
+                res_bullets.append(f"- Posible colinealidad: **{num_cols[i]} ~ {num_cols[j]}** (|r|≈{max_corr:.2f}).")
+    except Exception:
+        pass
+    # VIF alto
+    if not vif_df.empty and (vif_df["vif"] > 10).any():
+        high = vif_df[vif_df["vif"] > 10].head(5)
+        res_bullets.append("- VIF alto (>10): " + ", ".join([f"**{f}** ({v:.1f})" for f,v in zip(high['feature'], high['vif'])]) + ".")
+    # Sugerencias rápidas
+    for s in suggest_transforms(df):
+        res_bullets.append(f"- {s}")
+
+    st.markdown("\n".join(res_bullets))
+
 
 # ------------------------------- ML TAB -------------------------------
 with tab_ml:
@@ -341,18 +418,19 @@ with tab_ml:
 
         # KPIs grandes
         from ui_theme import render_kpi_cards
+        # ===== KPI GRANDES (con % cuando aplica) =====
         ml = st.session_state["ml"]
         if tarea == "clasificación":
             items = [
-                ("Accuracy (test)", f"{ml['acc_te']:.3f}", f"Train: {ml['acc_tr']:.3f}"),
-                ("F1-macro (test)", f"{ml['f1_te']:.3f}", f"Train: {ml['f1_tr']:.3f}"),
-                ("Modelo", modelo_name, ""),
+                ("Accuracy (test)", f"{ml['acc_te']*100:.1f}%", f"Train: {ml['acc_tr']*100:.1f}%"),
+                ("F1-macro (test)", f"{ml['f1_te']*100:.1f}%", f"Train: {ml['f1_tr']*100:.1f}%"),
+                ("Clases", f"{len(ml['labels'])}", "en test"),
             ]
         else:
             items = [
                 ("RMSE (test)", f"{ml['rmse']:.3f}", f"Baseline media: {ml['rmse_baseline']:.3f}"),
                 ("MAE (test)", f"{ml['mae']:.3f}", ""),
-                ("R² (test)", f"{ml['r2']:.3f}", ""),
+                ("R² (test)", f"{ml['r2']*100:.1f}%", ""),
             ]
         render_kpi_cards(items, caption="Resultados del entrenamiento")
 
