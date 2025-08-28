@@ -29,11 +29,11 @@ except Exception as e:
     PX_ERR = e
 
 # ===================== Config & Tema =====================
-st.set_page_config(page_title="Asistente Genético (EDA+ML+Groq)", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="Asistente BIOGEN", page_icon="🧬", layout="wide")
 apply_bio_theme()
 
-st.title("🧬 Asistente Genético")
-st.caption("Sube un CSV  → EDA → Baseline ML → Chat en español con Groq. "
+st.title("🧬 Asistente BIOGEN Insights")
+st.caption("Carga un dataset de contenido relacionado a temas biológicos (o genéticos) e interactua en lenguaje natural para explorar sus posibilidades"
            "Herramienta educativa; **no** es consejo médico.")
 
 # ===================== Sidebar =====================
@@ -82,7 +82,7 @@ tab_chat, tab_eda, tab_ml, tab_demo, tab_export = st.tabs(
 
 # ------------------------------- CHAT TAB (con scroll) -------------------------------
 with tab_chat:
-    st.subheader("Chat en español (Groq)")
+    st.subheader("Chat assistant (Groq)")
     model_id = st.session_state.get("llm_model_id") or "llama-3.1-8b-instant"
     api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
     temp = float(st.session_state.get("llm_temp", 0.2))
@@ -93,7 +93,7 @@ with tab_chat:
 
     if "mensajes" not in st.session_state:
         st.session_state.mensajes = [{"role":"assistant",
-                                      "content":"Hola 👋 Puedo responder en español sobre tu dataset, el EDA y el baseline ML. ¿Qué quieres saber?"}]
+                                      "content":"Hola 👋 Puedo responder en español sobre tu dataset, el EDA, un ML baseline o temas generales de biología. ¿Qué quieres saber?"}]
     # Render histórico simple
     for m in st.session_state.mensajes:
         with st.chat_message(m["role"]):
@@ -164,7 +164,7 @@ with tab_eda:
         st.write("**Tipos y cardinalidades**")
         st.dataframe(dtype_tbl, use_container_width=True, height=260)
 
-    st.write("**Descriptivos numéricos**")
+    st.write("**Análisis descriptivo**")
     num_desc = eda["desc_num"]
     if not num_desc.empty:
         st.dataframe(num_desc, use_container_width=True, height=260)
@@ -174,13 +174,13 @@ with tab_eda:
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
     cat_cols = df.select_dtypes(exclude=np.number).columns.tolist()
 
-    with st.expander("Distribuciones numéricas (hasta 6) con box marginal"):
+    with st.expander("Distribuciones numéricas (Top 5)"):
         if PLOTLY_OK:
             for c in num_cols[:6]:
                 st.plotly_chart(px.histogram(df, x=c, nbins=40, title=c, marginal="box",
                                              template=PLOTLY_TEMPLATE), use_container_width=True)
 
-    with st.expander("Frecuencias categóricas (hasta 6)"):
+    with st.expander("Frecuencias categóricas (Top 5)"):
         if PLOTLY_OK:
             for c in cat_cols[:6]:
                 vc = df[c].astype(str).value_counts(dropna=False).head(20).reset_index()
@@ -189,14 +189,14 @@ with tab_eda:
                                 use_container_width=True)
 
     if len(num_cols) >= 2 and PLOTLY_OK:
-        st.subheader("Matriz de correlación (subset numérico)")
+        st.subheader("Matriz de correlación (variables numéricas)")
         corr = df[num_cols[:12]].corr(numeric_only=True)
         st.plotly_chart(px.imshow(corr, text_auto=False, aspect="auto", title="Correlaciones",
                                   template=PLOTLY_TEMPLATE), use_container_width=True)
 
 # ------------------------------- ML TAB -------------------------------
 with tab_ml:
-    st.subheader("Baseline ML mínimo")
+    st.subheader("Baseline ML")
     posibles_targets = [c for c in df.columns if c.lower() in ("etiqueta","label","target")]
     target_sugerido = posibles_targets[0] if posibles_targets else df.columns[0]
     target = st.selectbox("Variable objetivo", options=df.columns,
@@ -204,22 +204,22 @@ with tab_ml:
     y = df[target]
     X = df.drop(columns=[target])
     tarea = infer_task(y)
-    st.write(f"Tarea detectada: **{tarea}**")
+    st.write(f"Tarea de Machine Learning detectada: **{tarea}**")
 
     # Config de split
-    st.markdown("**Configuración de partición train/test**")
+    st.markdown("**Configuración de particiones train/test**")
     csplit = st.columns(3)
     with csplit[0]:
         test_size = st.slider("Proporción de test", 0.10, 0.50, 0.20, 0.05)
     with csplit[1]:
-        force_strat = st.checkbox("Forzar estratificación auto-ajustando test_size", value=True)
+        force_strat = st.checkbox("Forzar estratificación auto ajustando test_size", value=True)
     with csplit[2]:
         max_ts = st.slider("Máximo test_size permitido", 0.20, 0.50, max(0.35, test_size), 0.05,
                            help="Se usa solo si está activado 'Forzar estratificación'.")
 
     # Distribución global de la etiqueta
     if tarea == "clasificación":
-        st.markdown("**Distribución de la etiqueta (global):**")
+        st.markdown("**Distribución de la variable de respuesta:**")
         vc_abs = y.astype(str).value_counts()
         vc_pct = (y.astype(str).value_counts(normalize=True) * 100).round(1)
         st.dataframe(pd.DataFrame({"conteo": vc_abs, "porcentaje_%": vc_pct}),
@@ -230,7 +230,7 @@ with tab_ml:
     modelo = LogisticRegression(max_iter=600) if tarea == "clasificación" else LinearRegression()
     pipe = Pipeline([("prep", pre), ("model", modelo)])
 
-    if st.button("Entrenar baseline"):
+    if st.button("Entrenar modelo baseline"):
         # Split robusto
         X_tr, X_te, y_tr, y_te, split_info = safe_train_test_split(
             X, y, tarea=tarea,
@@ -312,7 +312,7 @@ with tab_demo:
 
 # ------------------------------- EXPORT TAB -------------------------------
 with tab_export:
-    st.subheader("Exportar resumen EDA")
+    st.subheader("Exportar resumen del EDA")
     md = eda_summary_markdown(eda)
     st.write("**Vista previa (Markdown):**")
     st.code(md, language="markdown")
@@ -330,6 +330,6 @@ with tab_export:
 
     num_desc = eda["desc_num"]
     if not num_desc.empty:
-        st.download_button("⬇️ descriptivos_numericos.csv",
+        st.download_button("⬇️ analisis_descriptivo.csv",
                            data=num_desc.to_csv(index=True).encode("utf-8"),
-                           file_name="descriptivos_numericos.csv", mime="text/csv")
+                           file_name="analisis_descriptivo.csv", mime="text/csv")
