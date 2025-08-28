@@ -61,6 +61,12 @@ with st.sidebar:
     st.markdown("**Parámetros**")
     st.session_state["llm_temp"] = st.slider("Temperatura", 0.0, 1.0, st.session_state.get("llm_temp", 0.2), 0.05)
     st.session_state["llm_max_tokens"] = st.slider("Máx. tokens salida", 50, 800, st.session_state.get("llm_max_tokens", 350), 10)
+    st.session_state["ctx_limit"] = st.slider(
+    "Límite de contexto para el LLM (tokens aprox.)",
+    300, 3000, st.session_state.get("ctx_limit", 1200), 50,
+    help="El contexto EDA/ML se truncará adecuadamente a este límite"
+    )
+
 
 # ===================== Cargar datos =====================
 if up is not None:

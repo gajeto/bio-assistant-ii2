@@ -18,6 +18,8 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier,
 from sklearn.svm import LinearSVC, SVR
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.metrics import precision_recall_fscore_support
+
 
 
 
@@ -160,21 +162,122 @@ def ml_metrics_and_artifacts(pipe: Pipeline, X_tr, X_te, y_tr, y_te, tarea: str)
     return out
 
 def ml_key_insights(ml: Dict, X_te: pd.DataFrame) -> list[str]:
-    bullets = [f"Evaluación en test con {len(ml['y_te'])} muestras."]
+    """
+    Resumen enriquecido del baseline ML con la mayor información útil para LLM.
+    Incluye:
+    - Métricas globales (y gap train-test).
+    - Desbalance y distribución por clase (clasificación).
+    - Métricas por clase (top peores por F1) y confusiones más frecuentes.
+    - Mejoras respecto a baseline ingenuo (regresión) y diagnóstico de residuales.
+    - Importancias por permutación (top) y variables candidatas a ingeniería.
+    - Señales de sobreajuste/subajuste.
+    """
+    bullets = []
+
+    # 0) Modelo utilizado (si está guardado por la app)
+    if "modelo_name" in ml:
+        bullets.append(f"Modelo: **{ml['modelo_name']}**.")
+
+    # 1) Tamaño de test
+    ntest = len(ml["y_te"])
+    bullets.append(f"Evaluación en test: **{ntest}** muestras.")
+
     if ml["tarea"] == "clasificación":
-        bullets.append(f"Accuracy={ml['acc_te']:.3f}, F1-macro={ml['f1_te']:.3f}. (train acc={ml['acc_tr']:.3f}, f1={ml['f1_tr']:.3f})")
-        dist = pd.Series(ml["y_te"]).astype(str).value_counts(normalize=True); maj = dist.idxmax()
-        bullets.append(f"Clase mayoritaria en test: {maj} ({dist.max()*100:.1f}%).")
+        # 2) Métricas globales y gap
+        acc_te, f1_te = ml["acc_te"], ml["f1_te"]
+        acc_tr, f1_tr = ml["acc_tr"], ml["f1_tr"]
+        bullets.append(
+            f"Rendimiento global (test): Accuracy=**{acc_te:.3f}** ({acc_te*100:.1f}%), "
+            f"F1-macro=**{f1_te:.3f}** ({f1_te*100:.1f}%). "
+            f"(train: acc={acc_tr:.3f}/{acc_tr*100:.1f}%, f1={f1_tr:.3f}/{f1_tr*100:.1f}%)."
+        )
+        gap = (acc_tr - acc_te) + (f1_tr - f1_te)
+        if gap > 0.15:
+            bullets.append("Señal de **sobreajuste** (gap notable train-test).")
+        elif gap < -0.05:
+            bullets.append("Test > Train (posible **subajuste** o split favorable).")
+        else:
+            bullets.append("Generalización **razonable** (métricas similares entre train y test).")
+
+        # 3) Distribución de clases (desbalance)
+        yte = pd.Series(ml["y_te"]).astype(str)
+        dist = yte.value_counts(normalize=True)
+        maj = dist.idxmax(); pmaj = float(dist.max())
+        bullets.append(
+            f"Distribución de la etiqueta (test): mayoritaria **{maj}** ({pmaj*100:.1f}%)."
+        )
+        if pmaj >= 0.7:
+            bullets.append("**Desbalance alto**; considerar estratificación, ponderación o muestreo.")
+
+        # 4) Métricas por clase (top peores F1)
+        y_pred = pd.Series(ml["pred_te"]).astype(str).values
+        labels = sorted(yte.unique().tolist())
+        pr, rc, f1, _ = precision_recall_fscore_support(yte.values, y_pred, labels=labels, zero_division=0)
+        per_class = pd.DataFrame({"clase": labels, "precision": pr, "recall": rc, "f1": f1})
+        worst = per_class.sort_values("f1").head(min(3, len(per_class)))
+        bullets.append(
+            "Clases con **peor F1**: " +
+            ", ".join([f"{r.clase} (P={r.precision:.2f}, R={r.recall:.2f}, F1={r.f1:.2f})" for _, r in worst.iterrows()])
+            + "."
+        )
+
+        # 5) Errores más frecuentes (ya calculados)
         if ml.get("top_errors"):
-            bullets.append("Errores frecuentes (real→pred): " + ", ".join([f"{r}→{p}:{n}" for r,p,n in ml["top_errors"][:3]]))
+            top = ", ".join([f"{r}→{p}:{n}" for r, p, n in ml["top_errors"][:3]])
+            bullets.append(f"Confusiones dominantes (real→pred): {top}.")
+
+        # 6) Importancias
+        imp = ml["perm_importance"]
+        if hasattr(imp, "empty") and not imp.empty:
+            top_feats = ", ".join(f"{row.feature}({row.importance:.3f})" for _, row in imp.head(5).iterrows())
+            bullets.append("Variables más influyentes (perm.): " + top_feats + ".")
+            # Sugerencias de FE a partir de importancias
+            bullets.append("Sugerencia: explorar interacciones y transformaciones de las variables más influyentes.")
+
     else:
-        bullets.append(f"MAE={ml['mae']:.3f}, RMSE={ml['rmse']:.3f}, R²={ml['r2']:.3f}. RMSE baseline(media)={ml['rmse_baseline']:.3f}.")
-        bullets.append(f"Residuo medio ≈ {ml['resid_mean']:.3f}; p95(|resid|) ≈ {ml['resid_p95']:.3f}.")
-    imp = ml["perm_importance"]
-    if hasattr(imp, "empty") and not imp.empty:
-        top_feats = ", ".join(f"{row.feature}({row.importance:.3f})" for _, row in imp.head(5).iterrows())
-        bullets.append("Features más influyentes (perm.): " + top_feats)
+        # 2) Métricas globales y comparación con baseline ingenuo
+        rmse, mae, r2 = ml["rmse"], ml["mae"], ml["r2"]
+        base = ml["rmse_baseline"]
+        impv = (1.0 - (rmse / base)) * 100.0 if base and base > 0 else np.nan
+        bullets.append(
+            f"Rendimiento global (test): RMSE=**{rmse:.3f}**, MAE=**{mae:.3f}**, R²=**{r2:.3f}** ({r2*100:.1f}%). "
+            f"Mejora vs baseline ingenuo (media): **{impv:.1f}%**."
+        )
+
+        # 3) Diagnóstico de residuales
+        resid = pd.Series(ml["y_te"], dtype=float) - pd.Series(ml["pred_te"], dtype=float)
+        r_mean = float(np.mean(resid))
+        r_p95 = float(np.percentile(np.abs(resid), 95))
+        r_skew = float(resid.skew(skipna=True))
+        r_kurt = float(resid.kurtosis(skipna=True))
+        # Heteroscedasticidad (aprox): correlación |resid| vs pred
+        try:
+            r_abs = np.abs(resid)
+            r_pred = pd.Series(ml["pred_te"], dtype=float)
+            corr_hr = float(np.corrcoef(r_abs.fillna(0), r_pred.fillna(0))[0, 1])
+        except Exception:
+            corr_hr = np.nan
+        bullets.append(
+            f"Residuales: media≈{r_mean:.3f}, p95(|resid|)≈{r_p95:.3f}, skew≈{r_skew:.2f}, kurtosis≈{r_kurt:.2f}, "
+            f"corr(|resid|, pred)≈{corr_hr:.2f}."
+        )
+        if abs(r_mean) > 0.1 * rmse:
+            bullets.append("Posible **sesgo** (residuo medio alejado de 0).")
+        if abs(corr_hr) >= 0.3 and np.isfinite(corr_hr):
+            bullets.append("Señal de **heteroscedasticidad** (|resid| correlaciona con la predicción).")
+
+        # 4) Importancias
+        imp = ml["perm_importance"]
+        if hasattr(imp, "empty") and not imp.empty:
+            top_feats = ", ".join(f"{row.feature}({row.importance:.3f})" for _, row in imp.head(5).iterrows())
+            bullets.append("Variables más influyentes (perm.): " + top_feats + ".")
+            bullets.append("Sugerencia: revisar transformaciones de las variables más influyentes (p. ej., Yeo-Johnson).")
+
+        # 5) Interpretación objetiva (existente)
+        bullets.append(ml_objective_interpretation(ml))
+
     return bullets
+
 
 def ml_objective_interpretation(ml: Dict) -> str:
     if ml["tarea"] == "clasificación":
