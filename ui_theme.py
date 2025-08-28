@@ -10,7 +10,7 @@ SIDE_BG = "https://images.unsplash.com/photo-1583912268180-6ec9a24b8301?q=80&w=1
 SIDEBAR_ILLUSTRATION = "https://r2.erweima.ai/i/CmS5w6EvRFC7ANS9Ls788g.png"
 
 
-def apply_bio_theme(show_sidebar_image: bool = True, sidebar_caption: str = "Análisis de datos biológicos / genéticos"):
+def apply_bio_theme(show_sidebar_image: bool = True, sidebar_caption: str = "Asistente de datos biológicos y genéticos"):
     """
     Inyecta estilos del tema (fondos, tabs con color, scrollbox, KPI cards) y
     opcionalmente coloca una imagen representativa en la barra lateral.
