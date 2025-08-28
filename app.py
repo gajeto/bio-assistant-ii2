@@ -11,9 +11,12 @@ from utils_data import (
 from ml_utils import (
     infer_task, make_preprocessor, make_preprocessor_advanced,
     ml_metrics_and_artifacts, ml_key_insights, ml_objective_interpretation,
-    safe_train_test_split
+    safe_train_test_split, model_choices, build_model, ml_bullet_summary
 )
-from eda import outlier_report, skew_kurtosis_table, suggest_transforms, find_top_corr_pair
+from eda import (
+    outlier_report, skew_kurtosis_table, suggest_transforms, find_top_corr_pair,
+    pca_2d, dbscan_outliers
+)
 from llm_groq import GroqLLM, build_system_prompt, GROQ_MODEL_CATALOG
 from ui_theme import apply_bio_theme, render_kpi_cards   # ← import KPI cards
 from demo_tab import render_demo_tab
@@ -202,7 +205,9 @@ with tab_eda:
 
 # ------------------------------- ML TAB -------------------------------
 with tab_ml:
-    st.subheader("Baseline ML mínimo")
+    st.subheader("Baseline ML enriquecido")
+
+    # ======= Selección de target y tarea =======
     posibles_targets = [c for c in df.columns if c.lower() in ("etiqueta","label","target")]
     target_sugerido = posibles_targets[0] if posibles_targets else df.columns[0]
     target = st.selectbox("Variable objetivo", options=df.columns,
@@ -212,7 +217,7 @@ with tab_ml:
     tarea = infer_task(y_all)
     st.write(f"Tarea detectada: **{tarea}**")
 
-    # Config de split
+    # ======= Config de split =======
     st.markdown("**Configuración de partición train/test**")
     csplit = st.columns(3)
     with csplit[0]:
@@ -220,24 +225,57 @@ with tab_ml:
     with csplit[1]:
         force_strat = st.checkbox("Forzar estratificación auto-ajustando test_size", value=True)
     with csplit[2]:
-        max_ts = st.slider("Máximo test_size permitido", 0.20, 0.50, max(0.35, test_size), 0.05,
-                           help="Se usa solo si está activado 'Forzar estratificación'.")
+        max_ts = st.slider("Máximo test_size permitido", 0.20, 0.50, max(0.35, test_size), 0.05)
 
-    # Config de preprocesamiento/FE
-    st.markdown("**Preprocesamiento y FE para el baseline**")
+    # ======= Selección de modelo =======
+    st.markdown("**Modelo**")
+    modelos = model_choices(tarea)
+    modelo_name = st.selectbox("Tipo de modelo", options=modelos,
+                               index=(modelos.index("Logistic Regression") if tarea=="clasificación" else modelos.index("Linear Regression")))
+    modelo = build_model(tarea, modelo_name)
+
+    # ======= Preprocesamiento =======
+    st.markdown("**Preprocesamiento y FE**")
     cprep = st.columns(3)
     with cprep[0]:
-        use_advanced = st.checkbox("Preprocesamiento avanzado (robusto)", value=True,
-                                   help="Mediana/RobustScaler + Yeo-Johnson + OneHot min_frequency")
+        use_advanced = st.checkbox("Preprocesamiento avanzado (robusto)", value=True)
     with cprep[1]:
-        yeoj = st.checkbox("Yeo-Johnson (estabiliza varianza)", value=True)
+        yeoj = st.checkbox("Yeo-Johnson", value=True)
     with cprep[2]:
-        minfreq = st.slider("OneHot min_frequency", 0.0, 0.10, 0.01, 0.01,
-                            help="Agrupa categorías raras; 0 desactiva (usa OneHot estándar).")
+        minfreq = st.slider("OneHot min_frequency", 0.0, 0.10, 0.01, 0.01)
 
-    add_interaction = st.checkbox("Añadir interacción simple (producto) del par numérico más correlacionado", value=True)
+    add_interaction = st.checkbox("Interacción (producto) del par numérico más correlacionado", value=True)
 
-    # Distribución global de la etiqueta
+    # ======= Exploración (opcional): PCA + DBSCAN =======
+    with st.expander("Exploración PCA/DBSCAN (opcional)"):
+        can_pca = X_all.select_dtypes(include=np.number).shape[1] >= 2
+        if can_pca and PLOTLY_OK:
+            pca_df, pca_obj, _ = pca_2d(X_all)
+            if pca_df is not None:
+                st.plotly_chart(px.scatter(pca_df, x="PC1", y="PC2", title="PCA (2D)",
+                                           template=PLOTLY_TEMPLATE), use_container_width=True)
+        else:
+            st.caption("PCA no disponible (se requieren ≥2 columnas numéricas).")
+
+        # DBSCAN
+        eps = st.slider("DBSCAN eps", 0.1, 3.0, 0.7, 0.1)
+        min_s = st.slider("DBSCAN min_samples", 3, 50, 10, 1)
+        excluir_outliers = st.checkbox("Excluir outliers DBSCAN antes de entrenar (no supervisado)", value=False)
+        lab, out_mask = dbscan_outliers(X_all, eps=eps, min_samples=min_s)
+        if lab is not None:
+            out_count = int(out_mask.sum())
+            st.write(f"Etiquetas DBSCAN: clusters={len(set(lab)) - (1 if (-1 in lab) else 0)}, outliers={out_count}")
+            if can_pca and PLOTLY_OK:
+                # colorear por cluster; resaltar -1
+                pca_df, _, _ = pca_2d(X_all)
+                color = pd.Series(lab, dtype="int").astype(str).replace({"-1": "outlier"})
+                fig = px.scatter(pca_df, x="PC1", y="PC2", color=color,
+                                 title="PCA coloreado por DBSCAN (outlier=-1)", template=PLOTLY_TEMPLATE)
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("DBSCAN no disponible (sin columnas numéricas).")
+
+    # ======= Distribución global de la etiqueta =======
     if tarea == "clasificación":
         st.markdown("**Distribución de la etiqueta (global):**")
         vc_abs = y_all.astype(str).value_counts()
@@ -245,17 +283,26 @@ with tab_ml:
         st.dataframe(pd.DataFrame({"conteo": vc_abs, "porcentaje_%": vc_pct}),
                      use_container_width=True, height=220)
 
-    # Modelo
-    modelo = LogisticRegression(max_iter=600) if tarea == "clasificación" else LinearRegression()
-
+    # ======= Entrenamiento =======
     if st.button("Entrenar baseline"):
+        # Opción: excluir outliers antes de split (aviso de que es no supervisado)
+        X_use, y_use = X_all, y_all
+        if 'excluir_outliers' in locals() and excluir_outliers and (out_mask is not None):
+            keep = ~out_mask
+            removed = int(out_mask.sum())
+            X_use = X_all.loc[keep].reset_index(drop=True)
+            y_use = y_all.loc[keep].reset_index(drop=True)
+            st.warning(f"Se excluyeron {removed} filas marcadas como outliers por DBSCAN (no supervisado).")
+
         # Split robusto
         X_tr, X_te, y_tr, y_te, split_info = safe_train_test_split(
-            X_all, y_all, tarea=tarea,
+            X_use, y_use, tarea=tarea,
             test_size=float(test_size), random_state=42,
             min_per_class=2, auto_increase_test_size=bool(force_strat), max_test_size=float(max_ts),
         )
-        # Interacción (basada en TRAIN para evitar fugas graves)
+
+        # Interacción (en TRAIN/TEST para evitar fugas)
+        from eda_plus import find_top_corr_pair
         if add_interaction:
             pair = find_top_corr_pair(X_tr)
             if pair:
@@ -272,12 +319,13 @@ with tab_ml:
         else:
             pre = make_preprocessor(X_tr)
 
+        from sklearn.pipeline import Pipeline
         pipe = Pipeline([("prep", pre), ("model", modelo)])
 
-        # Métricas del split
+        # Feedback split
         colm = st.columns(3)
         with colm[0]:
-            st.metric("Clases", split_info.get("n_classes") or (y_all.nunique() if tarea=="clasificación" else "-"))
+            st.metric("Clases", split_info.get("n_classes") or (y_use.nunique() if tarea=="clasificación" else "-"))
         with colm[1]:
             st.metric("test_size usado", f"{split_info['used_test_size']:.2f}")
         with colm[2]:
@@ -289,15 +337,16 @@ with tab_ml:
 
         # Entrenar & guardar
         ml_art = ml_metrics_and_artifacts(pipe, X_tr, X_te, y_tr, y_te, tarea)
-        st.session_state["ml"] = {"pipeline": pipe, "X_te": X_te, "y_te": y_te, **ml_art}
+        st.session_state["ml"] = {"pipeline": pipe, "X_te": X_te, "y_te": y_te, **ml_art, "modelo_name": modelo_name}
 
-        # KPI GRANDES
+        # KPIs grandes
+        from ui_theme import render_kpi_cards
         ml = st.session_state["ml"]
         if tarea == "clasificación":
             items = [
                 ("Accuracy (test)", f"{ml['acc_te']:.3f}", f"Train: {ml['acc_tr']:.3f}"),
                 ("F1-macro (test)", f"{ml['f1_te']:.3f}", f"Train: {ml['f1_tr']:.3f}"),
-                ("Clases", f"{len(ml['labels'])}", "en test"),
+                ("Modelo", modelo_name, ""),
             ]
         else:
             items = [
@@ -307,27 +356,21 @@ with tab_ml:
             ]
         render_kpi_cards(items, caption="Resultados del entrenamiento")
 
-    # Visualizaciones + importancias
+    # ======= Visualizaciones y resumen final =======
     if "ml" in st.session_state and st.session_state["ml"]["tarea"] == tarea:
         ml = st.session_state["ml"]
-        if tarea == "clasificación":
-            st.write(f"**Accuracy (test):** {ml['acc_te']:.3f} | **F1-macro (test):** {ml['f1_te']:.3f} "
-                     f"(train: acc={ml['acc_tr']:.3f}, f1={ml['f1_tr']:.3f})")
-            if PLOTLY_OK:
-                etiquetas = ml["labels"]; cm = ml["cm"]
-                fig_cm = px.imshow(cm, x=etiquetas, y=etiquetas, text_auto=True, color_continuous_scale="Greens",
-                                   title="Matriz de confusión", template=PLOTLY_TEMPLATE)
-                fig_cm.update_layout(xaxis_title="Predicha", yaxis_title="Real")
-                st.plotly_chart(fig_cm, use_container_width=True)
-        else:
-            st.write(f"**MAE:** {ml['mae']:.3f} | **RMSE:** {ml['rmse']:.3f} | **R²:** {ml['r2']:.3f} "
-                     f"| **RMSE baseline(media):** {ml['rmse_baseline']:.3f}")
-            if PLOTLY_OK:
-                resid = ml["y_te"] - ml["pred_te"]
-                st.plotly_chart(px.scatter(x=ml["pred_te"], y=resid, labels={"x":"Predicción","y":"Residual"},
-                                           title="Predicción vs Residual", template=PLOTLY_TEMPLATE), use_container_width=True)
-                st.plotly_chart(px.histogram(resid, nbins=40, title="Histograma de residuales",
-                                             template=PLOTLY_TEMPLATE), use_container_width=True)
+        if tarea == "clasificación" and PLOTLY_OK:
+            etiquetas = ml["labels"]; cm = ml["cm"]
+            fig_cm = px.imshow(cm, x=etiquetas, y=etiquetas, text_auto=True, color_continuous_scale="Greens",
+                               title=f"Matriz de confusión – {ml.get('modelo_name','')}", template=PLOTLY_TEMPLATE)
+            fig_cm.update_layout(xaxis_title="Predicha", yaxis_title="Real")
+            st.plotly_chart(fig_cm, use_container_width=True)
+        elif tarea != "clasificación" and PLOTLY_OK:
+            resid = ml["y_te"] - ml["pred_te"]
+            st.plotly_chart(px.scatter(x=ml["pred_te"], y=resid, labels={"x":"Predicción","y":"Residual"},
+                                       title=f"Predicción vs Residual – {ml.get('modelo_name','')}", template=PLOTLY_TEMPLATE), use_container_width=True)
+            st.plotly_chart(px.histogram(resid, nbins=40, title="Histograma de residuales",
+                                         template=PLOTLY_TEMPLATE), use_container_width=True)
 
         imp = ml["perm_importance"]
         st.write("**Importancias por permutación (top):**")
@@ -336,7 +379,12 @@ with tab_ml:
             st.plotly_chart(px.bar(imp, x="feature", y="importance", error_y="std",
                                    title="Importancia (perm)", template=PLOTLY_TEMPLATE),
                             use_container_width=True)
-        st.info(ml_objective_interpretation(ml))
+
+        # ——— Resumen en bullets de los insights de modelado ———
+        st.subheader("📌 Resumen de modelado (insights)")
+        bullets = ml_bullet_summary(ml)
+        st.markdown("\n".join(f"- {b}" for b in bullets))
+
 
 
 # ------------------------------- DEMO TAB -------------------------------

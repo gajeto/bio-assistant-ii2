@@ -1,6 +1,11 @@
 # eda_plus.py
 import pandas as pd
 import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.cluster import DBSCAN
 
 def numeric_cols(df: pd.DataFrame):
     return list(df.select_dtypes(include=np.number).columns)
@@ -81,3 +86,38 @@ def find_top_corr_pair(df: pd.DataFrame) -> tuple[str, str] | None:
     idx = np.nanargmax(corr.values)
     r, c = np.unravel_index(idx, corr.shape)
     return nums[r], nums[c]
+
+def _prepare_numeric_matrix(df: pd.DataFrame):
+    X_num = df.select_dtypes(include=np.number)
+    if X_num.shape[1] == 0:
+        return None, None
+    pipe = Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
+        ("sc", StandardScaler())
+    ])
+    M = pipe.fit_transform(X_num)
+    return M, pipe
+
+def pca_2d(df: pd.DataFrame):
+    """
+    Devuelve (df_pca, pca, prep) o (None, None, None) si no hay suficientes numéricas.
+    """
+    M, prep = _prepare_numeric_matrix(df)
+    if M is None or M.shape[1] < 2:
+        return None, None, None
+    pca = PCA(n_components=2, random_state=42)
+    Z = pca.fit_transform(M)
+    comp = pd.DataFrame({"PC1": Z[:, 0], "PC2": Z[:, 1]})
+    return comp, pca, prep
+
+def dbscan_outliers(df: pd.DataFrame, eps: float = 0.7, min_samples: int = 10):
+    """
+    Devuelve (labels, out_mask) o (None, None) si no hay numéricas.
+    labels = -1 son outliers.
+    """
+    M, prep = _prepare_numeric_matrix(df)
+    if M is None:
+        return None, None
+    lab = DBSCAN(eps=float(eps), min_samples=int(min_samples)).fit_predict(M)
+    out_mask = (lab == -1)
+    return lab, out_mask
